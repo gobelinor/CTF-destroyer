@@ -1,0 +1,11 @@
+{
+  "title": "Evaluative",
+  "category": "misc",
+  "description": "A rogue bot is malfunctioning, generating cryptic sequences that control secure data vaults. Your task? Decode its logic and compute the correct output before the system locks you out!",
+  "target_host": "xxx.xx.xxx.xx:xxxxx",
+  "difficulty": "Very Easy",
+  "points": 10,
+  "rating": 3.3,
+  "votes": 76,
+  "files": []
+}
