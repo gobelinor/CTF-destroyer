@@ -48,6 +48,7 @@ class WorkerRequest:
     workspace: Path
     skill: Skill
     prior_attempts: list[dict[str, Any]]
+    working_memory: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -230,7 +231,16 @@ class SubprocessWorker(WorkerBackend, ABC):
         )
 
     def _build_prompt(self, request: WorkerRequest) -> str:
-        prior_attempts = json.dumps(request.prior_attempts, indent=2) if request.prior_attempts else "[]"
+        prior_attempts = (
+            json.dumps(_compact_attempts_for_prompt(request.prior_attempts), indent=2, ensure_ascii=False)
+            if request.prior_attempts
+            else "[]"
+        )
+        working_memory = (
+            json.dumps(request.working_memory, indent=2, ensure_ascii=False)
+            if request.working_memory
+            else "{}"
+        )
         artifacts = "\n".join(f"- {path}" for path in request.artifact_paths) or "- none"
         metadata = json.dumps(request.metadata, indent=2, ensure_ascii=False) if request.metadata else "{}"
         return textwrap.dedent(
@@ -253,6 +263,9 @@ class SubprocessWorker(WorkerBackend, ABC):
             Prior attempts:
             {prior_attempts}
 
+            Structured handoff memory:
+            {working_memory}
+
             Specialist skill: {request.skill.name}
             Skill description: {request.skill.description}
 
@@ -263,10 +276,13 @@ class SubprocessWorker(WorkerBackend, ABC):
             - Solve the CTF challenge if possible.
             - You may execute shell commands inside the workspace when needed.
             - If a target host is provided, prefer direct interaction with it using shell tools before relying on external references.
+            - Treat the workspace as persistent across attempts. Reuse existing scripts, logs and notes before restarting naive reconnaissance.
+            - For attempts greater than 1, inspect the handoff files and key commands in the structured memory before launching new exploration.
+            - Avoid repeating commands or hypotheses already marked low-value unless you have a concrete reason.
             - If you cannot finish, return the most useful next step.
             - If you find a candidate flag, include it in the `flag` field only.
             - Keep evidence concise and operational.
-            - Include the key commands you executed in the `commands` field.
+            - Include the key commands you executed in the `commands` field, especially any long inline scripts or one-liners that would otherwise be lost.
             - Do not rely on public writeups alone when direct interaction is feasible from the workspace.
             """
         ).strip()
@@ -320,7 +336,7 @@ class SubprocessWorker(WorkerBackend, ABC):
 
 class CodexWorker(SubprocessWorker):
     def __init__(self) -> None:
-        super().__init__(name="codex", timeout_seconds=int(os.getenv("CODEX_TIMEOUT_SECONDS", "600")))
+        super().__init__(name="codex", timeout_seconds=int(os.getenv("CODEX_TIMEOUT_SECONDS", "1800")))
         self.model = os.getenv("CODEX_MODEL", "")
         self.sandbox = _normalize_codex_sandbox(os.getenv("CODEX_SANDBOX", "workspace-write"))
         self.approval_policy = os.getenv("CODEX_APPROVAL_POLICY", "never")
@@ -517,7 +533,7 @@ class CodexWorker(SubprocessWorker):
 
 class ClaudeWorker(SubprocessWorker):
     def __init__(self) -> None:
-        super().__init__(name="claude", timeout_seconds=int(os.getenv("CLAUDE_TIMEOUT_SECONDS", "600")))
+        super().__init__(name="claude", timeout_seconds=int(os.getenv("CLAUDE_TIMEOUT_SECONDS", "1800")))
         self.model = os.getenv("CLAUDE_MODEL", "")
         self.permission_mode = os.getenv("CLAUDE_PERMISSION_MODE", "auto")
         self.extra_args = shlex.split(os.getenv("CLAUDE_EXTRA_ARGS", ""))
@@ -659,3 +675,31 @@ def _format_codex_event_line(line: str) -> str | None:
         exit_code = item.get("exit_code")
         return f"[codex] done ({exit_code}): {command}\n"
     return None
+
+
+def _compact_attempts_for_prompt(prior_attempts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    compacted: list[dict[str, Any]] = []
+    for attempt in prior_attempts[-3:]:
+        compacted.append(
+            {
+                "attempt": attempt.get("attempt"),
+                "backend": attempt.get("backend"),
+                "status": attempt.get("status"),
+                "summary": _truncate_for_prompt(str(attempt.get("summary", "")), 260),
+                "next_step": _truncate_for_prompt(str(attempt.get("next_step", "")), 220),
+                "evidence": [_truncate_for_prompt(str(item), 180) for item in list(attempt.get("evidence", []))[:3]],
+                "key_commands": [
+                    _truncate_for_prompt(str(item), 220) for item in list(attempt.get("key_commands", []))[:4]
+                ],
+                "inline_scripts": list(attempt.get("inline_scripts", []))[:2],
+                "handoff_files": list(attempt.get("handoff_files", []))[:4],
+            }
+        )
+    return compacted
+
+
+def _truncate_for_prompt(value: str, limit: int) -> str:
+    compact = " ".join(value.split())
+    if len(compact) <= limit:
+        return compact
+    return f"{compact[: limit - 3].rstrip()}..."

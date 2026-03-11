@@ -10,7 +10,7 @@ Le tool est encore un PoC, mais il fait déjà les choses suivantes:
 
 - normalisation d'entrées challenge hétérogènes
 - workspace dédié par challenge
-- copie locale des artefacts
+- copie locale et téléchargement HTTP(S) des artefacts
 - routage vers un skill CTF par catégorie
 - exécution de workers `mock`, `codex`, `claude`
 - boucle orchestrateur `route -> specialist -> evaluate`
@@ -27,6 +27,8 @@ Cycle d'un run:
 2. le challenge est normalisé
 3. un workspace local est créé sous `.challenges/<slug>-<hash>/`
 4. les artefacts sont copiés dans `artifacts/`
+   - chemins locaux: copie dans le workspace
+   - URLs `http(s)`: téléchargement automatique dans `artifacts/`
 5. le routeur choisit un skill spécialisé
 6. le worker sélectionné est lancé dans le workspace du challenge
 7. l'orchestrateur évalue le résultat et décide de stopper ou de relancer
@@ -199,6 +201,19 @@ Le worker `claude` utilise `claude -p` avec schéma JSON structuré. Il est bran
 - `CLAUDE_EXTRA_ARGS`
 - `CLAUDE_TIMEOUT_SECONDS`
 
+Les timeouts worker par defaut sont maintenant plus longs (`1800s`) pour eviter de casser trop vite les runs difficiles. Les attempts suivantes reutilisent aussi une memoire structuree persistee par challenge dans le workspace, sous `.runs/working-memory.json`, avec:
+
+- constats confirms
+- pistes de faible valeur a eviter
+- commandes et scripts inline importants
+- fichiers de handoff a relire avant de repartir
+
+Lorsqu'un challenge est relance apres un echec, l'orchestrateur recharge aussi `.runs/attempt-history.json`, fait une revue critique des tentatives precedentes, puis fournit au nouveau run:
+
+- les acquis a conserver
+- les chemins suspects ou deja sur-exploites
+- une consigne de reprise courte pour eviter de repartir dans les memes rabbit holes
+
 ## Tests
 
 ```bash
@@ -211,8 +226,46 @@ Le worker `claude` utilise `claude -p` avec schéma JSON structuré. Il est bran
 - pas encore de planificateur global de CTF entier
 - pas encore de persistance durable autre que le workspace local
 - pas encore d'UI live dédiée au-dessus du streaming stderr
-- pas encore d'intégration Discord
 - pas encore d'exploitation automatique des `references/` des skills
+
+## Intégration Discord
+
+Le CLI peut maintenant créer ou réutiliser un fil Discord par challenge dans un salon dédié, puis publier:
+
+- le message initial du challenge
+- le résultat du routage (catégorie + skill)
+- chaque tentative worker
+- le résultat final
+
+Le mapping local est persistant dans:
+
+- `.challenges/<slug>-<hash>/.discord-thread.json`
+- `challenge.json` via le champ `discord_thread`
+
+Exemple avec un salon texte qui héberge des threads:
+
+```bash
+export DISCORD_BOT_TOKEN=...
+export DISCORD_PARENT_CHANNEL_ID=123456789012345678
+
+ctf-orchestrator \
+  --challenge-file examples/evaluative.json \
+  --backend-sequence mock
+```
+
+Variables d'environnement et flags disponibles:
+
+- `DISCORD_BOT_TOKEN` / `--discord-bot-token`
+- `DISCORD_PARENT_CHANNEL_ID` / `--discord-parent-channel-id`
+- `.env` à la racine est chargé automatiquement s'il existe
+- `--env-file chemin/.env` permet de charger un autre fichier
+
+Exemple de `.env`:
+
+```dotenv
+DISCORD_BOT_TOKEN=ton_bot_token
+DISCORD_PARENT_CHANNEL_ID=1480705892918755544
+```
 
 ## Roadmap courte
 

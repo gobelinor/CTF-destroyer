@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 import shutil
 from typing import Any
+from urllib import parse, request
 
 
 SLUG_RE = re.compile(r"[^a-z0-9]+")
@@ -25,10 +26,15 @@ def prepare_challenge_workspace(
     copied_artifacts: list[str] = []
     used_names: set[str] = set()
     for artifact_path in artifact_paths:
-        source_path = _resolve_artifact_path(artifact_path, source_root)
-        target_name = _dedupe_name(source_path.name, used_names)
-        target_path = artifacts_dir / target_name
-        _copy_path(source_path, target_path)
+        if _is_http_url(artifact_path):
+            target_name = _dedupe_name(_name_for_remote_artifact(artifact_path), used_names)
+            target_path = artifacts_dir / target_name
+            _download_artifact(artifact_path, target_path)
+        else:
+            source_path = _resolve_artifact_path(artifact_path, source_root)
+            target_name = _dedupe_name(source_path.name, used_names)
+            target_path = artifacts_dir / target_name
+            _copy_path(source_path, target_path)
         copied_artifacts.append(str(target_path.relative_to(challenge_dir)))
 
     manifest = dict(challenge_payload)
@@ -39,6 +45,20 @@ def prepare_challenge_workspace(
         encoding="utf-8",
     )
     return challenge_dir, copied_artifacts
+
+
+def merge_challenge_manifest(challenge_dir: Path, updates: dict[str, Any]) -> None:
+    manifest_path = challenge_dir / "challenge.json"
+    if not manifest_path.exists():
+        return
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict):
+        raise ValueError("Challenge manifest must contain a JSON object.")
+    _deep_merge(manifest, updates)
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
 
 
 def _workspace_dir_for_challenge(workspace_root: Path, challenge_name: str) -> Path:
@@ -75,6 +95,27 @@ def _copy_path(source_path: Path, target_path: Path) -> None:
     shutil.copy2(source_path, target_path)
 
 
+def _download_artifact(url: str, target_path: Path) -> None:
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    with request.urlopen(url) as response:
+        with target_path.open("wb") as handle:
+            shutil.copyfileobj(response, handle)
+
+
+def _is_http_url(value: str) -> bool:
+    parsed = parse.urlparse(value)
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def _name_for_remote_artifact(url: str) -> str:
+    parsed = parse.urlparse(url)
+    candidate = Path(parse.unquote(parsed.path)).name
+    if candidate:
+        return candidate
+    digest = sha1(url.encode("utf-8")).hexdigest()[:12]
+    return f"artifact-{digest}"
+
+
 def _dedupe_name(name: str, used_names: set[str]) -> str:
     if name not in used_names:
         used_names.add(name)
@@ -89,3 +130,12 @@ def _dedupe_name(name: str, used_names: set[str]) -> str:
             used_names.add(candidate)
             return candidate
         index += 1
+
+
+def _deep_merge(base: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]:
+    for key, value in updates.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            _deep_merge(base[key], value)
+            continue
+        base[key] = value
+    return base

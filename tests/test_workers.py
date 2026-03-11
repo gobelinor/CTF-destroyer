@@ -1,6 +1,6 @@
 import unittest
 
-from ctf_destroyer.workers import CodexWorker, _format_codex_event_line
+from ctf_destroyer.workers import CodexWorker, _compact_attempts_for_prompt, _format_codex_event_line
 
 
 class WorkerTraceTest(unittest.TestCase):
@@ -29,6 +29,26 @@ class WorkerTraceTest(unittest.TestCase):
         )
         self.assertEqual(started, "[codex] start: /bin/zsh -lc pwd\n")
         self.assertEqual(completed, "[codex] done (0): /bin/zsh -lc pwd\n")
+
+    def test_prompt_attempt_compaction_keeps_key_commands_and_inline_scripts(self) -> None:
+        compacted = _compact_attempts_for_prompt(
+            [
+                {
+                    "attempt": 1,
+                    "backend": "codex",
+                    "status": "needs_retry",
+                    "summary": "A" * 400,
+                    "next_step": "Inspect generated script and continue.",
+                    "evidence": ["fact-1", "fact-2"],
+                    "key_commands": ["python3 -c \"print('hello')\"", "ls -la"],
+                    "inline_scripts": [{"command": "python3 -c ...", "snippet": "print('hello')"}],
+                    "handoff_files": [".runs/working-memory.json"],
+                }
+            ]
+        )
+        self.assertEqual(len(compacted), 1)
+        self.assertIn("python3 -c", compacted[0]["key_commands"][0])
+        self.assertEqual(compacted[0]["inline_scripts"][0]["snippet"], "print('hello')")
 
 
 if __name__ == "__main__":
