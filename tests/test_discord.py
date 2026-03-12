@@ -3,7 +3,12 @@ from tempfile import TemporaryDirectory
 import json
 import unittest
 
-from ctf_destroyer.discord_sync import DiscordClient, DiscordConfig, resolve_discord_config
+from ctf_destroyer.discord_sync import (
+    DiscordClient,
+    DiscordConfig,
+    DiscordThreadRef,
+    resolve_discord_config,
+)
 
 
 class FakeDiscordTransport:
@@ -107,6 +112,76 @@ class DiscordSyncTest(unittest.TestCase):
             self.assertEqual(transport.requests[0][1], "/channels/321/threads")
             self.assertEqual(transport.requests[0][2]["type"], 11)
             self.assertEqual(transport.requests[1][1], "/channels/thread-2/messages")
+
+    def test_publish_final_posts_writeup_when_solved(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            (workspace / "writeup.md").write_text(
+                "# Writeup\n\nShort solve summary.\n\n```bash\npython solve.py\n```",
+                encoding="utf-8",
+            )
+            transport = FakeDiscordTransport([{"id": "message-1"}, {"id": "message-2"}])
+            client = DiscordClient(
+                DiscordConfig(
+                    bot_token="token",
+                    parent_channel_id="321",
+                ),
+                transport=transport,
+            )
+            thread = DiscordThreadRef(
+                thread_id="thread-9",
+                thread_name="Thread",
+                parent_channel_id="321",
+            )
+
+            client.publish_final(
+                thread=thread,
+                final_state={
+                    "solved": True,
+                    "stop_reason": "solved",
+                    "attempts": 3,
+                    "final_summary": "Recovered the password.",
+                    "final_flag": "flag{demo}",
+                    "workspace": str(workspace),
+                },
+            )
+
+            self.assertEqual(len(transport.requests), 2)
+            self.assertEqual(transport.requests[0][1], "/channels/thread-9/messages")
+            self.assertIn("Run completed.", str(transport.requests[0][2]["content"]))
+            self.assertIn("# Writeup", str(transport.requests[1][2]["content"]))
+
+    def test_publish_final_skips_writeup_for_unsolved_runs(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            (workspace / "writeup.md").write_text("# Old Writeup", encoding="utf-8")
+            transport = FakeDiscordTransport([{"id": "message-1"}])
+            client = DiscordClient(
+                DiscordConfig(
+                    bot_token="token",
+                    parent_channel_id="321",
+                ),
+                transport=transport,
+            )
+            thread = DiscordThreadRef(
+                thread_id="thread-10",
+                thread_name="Thread",
+                parent_channel_id="321",
+            )
+
+            client.publish_final(
+                thread=thread,
+                final_state={
+                    "solved": False,
+                    "stop_reason": "max_attempts",
+                    "attempts": 4,
+                    "final_summary": "No flag.",
+                    "workspace": str(workspace),
+                },
+            )
+
+            self.assertEqual(len(transport.requests), 1)
+            self.assertIn("Solved: `no`", str(transport.requests[0][2]["content"]))
 
 
 if __name__ == "__main__":

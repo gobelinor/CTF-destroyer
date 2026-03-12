@@ -5,10 +5,12 @@ import json
 import os
 from pathlib import Path
 import sys
-from typing import Callable
+from typing import Any, Callable
 
+from .challenges import normalize_challenge_payload
 from .discord_sync import DiscordClient, DiscordThreadRef, load_thread_binding, resolve_discord_config
 from .graph import build_initial_state, build_orchestrator, load_resume_context
+from .writeups import generate_writeup_markdown
 from .workers import build_worker_pool
 from .workspace import prepare_challenge_workspace
 
@@ -65,7 +67,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    challenge = _normalize_challenge_payload(_load_challenge_file(args.challenge_file)) if args.challenge_file else {}
+    challenge = normalize_challenge_payload(_load_challenge_file(args.challenge_file)) if args.challenge_file else {}
     source_root = args.challenge_file.resolve().parent if args.challenge_file else Path.cwd()
     challenge_name = args.challenge_name or challenge.get("challenge_name")
     challenge_text = args.challenge_text or challenge.get("challenge_text")
@@ -76,6 +78,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if not challenge_name or not challenge_text:
         raise SystemExit("challenge name and challenge text are required.")
+    _validate_challenge_actionability(challenge_name, target_host, challenge_metadata)
 
     challenge_workspace, staged_artifacts = prepare_challenge_workspace(
         workspace_root=args.workspace,
@@ -160,6 +163,17 @@ def main(argv: list[str] | None = None) -> int:
         initial_state,
         config={"configurable": {"thread_id": args.thread_id}},
     )
+    _maybe_write_writeup(
+        workspace=challenge_workspace,
+        challenge_name=str(challenge_name),
+        challenge_text=str(challenge_text),
+        category_hint=category_hint,
+        target_host=target_host,
+        final_state=final_state,
+        skills_root=args.skills_root,
+        workers=workers,
+        backend_sequence=backend_sequence,
+    )
     if discord_client is not None and discord_thread is not None:
         try:
             discord_client.publish_final(discord_thread, final_state)
@@ -178,82 +192,237 @@ def _load_challenge_file(path: Path) -> dict[str, object]:
 
 
 def _normalize_challenge_payload(raw: dict[str, object]) -> dict[str, object]:
-    challenge_name = _coalesce_str(raw, "challenge_name", "title", "name")
-    challenge_text = _coalesce_str(
-        raw,
-        "challenge_text",
-        "description",
-        "scenario",
-        "challenge_scenario",
-        "prompt",
+    return normalize_challenge_payload(raw)
+
+
+def _validate_challenge_actionability(
+    challenge_name: str,
+    target_host: str | None,
+    challenge_metadata: dict[str, Any],
+) -> None:
+    import_metadata = challenge_metadata.get("import_metadata")
+    if not isinstance(import_metadata, dict):
+        return
+    if target_host:
+        return
+    if not import_metadata.get("start_instance_requested"):
+        return
+
+    start_result = str(import_metadata.get("start_instance_result") or "unknown")
+    warnings = import_metadata.get("warnings")
+    detail_suffix = ""
+    if isinstance(warnings, list) and warnings:
+        detail_suffix = f" Details: {'; '.join(str(item) for item in warnings)}"
+    raise SystemExit(
+        f"Challenge '{challenge_name}' is not actionable: instance access is missing "
+        f"after requested startup (start_instance_result={start_result}).{detail_suffix}"
     )
-    category_hint = _coalesce_str(raw, "category_hint", "category")
-    target_host = _coalesce_target_host(raw)
-    artifact_paths = _coalesce_artifacts(raw)
-    challenge_metadata = {
-        key: value
-        for key, value in raw.items()
-        if key
-        not in {
-            "challenge_name",
-            "title",
-            "name",
-            "challenge_text",
-            "description",
-            "scenario",
-            "challenge_scenario",
-            "prompt",
-            "category_hint",
-            "category",
-            "artifact_paths",
-            "artifacts",
-            "files",
-            "target_host",
-            "target",
-            "ip",
-            "port",
-        }
-    }
-    return {
-        "challenge_name": challenge_name,
-        "challenge_text": challenge_text,
-        "category_hint": category_hint,
-        "target_host": target_host,
-        "artifact_paths": artifact_paths,
-        "challenge_metadata": challenge_metadata,
-    }
 
 
-def _coalesce_str(raw: dict[str, object], *keys: str) -> str | None:
-    for key in keys:
-        value = raw.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return None
+def _maybe_write_writeup(
+    workspace: Path,
+    challenge_name: str,
+    challenge_text: str,
+    category_hint: str | None,
+    target_host: str | None,
+    final_state: dict[str, Any],
+    skills_root: Path | None = None,
+    workers: dict[str, object] | None = None,
+    backend_sequence: list[str] | None = None,
+) -> None:
+    if not final_state.get("solved"):
+        return
+    markdown = None
+    if skills_root is not None and workers and backend_sequence:
+        try:
+            markdown = generate_writeup_markdown(
+                workspace=workspace,
+                skills_root=skills_root,
+                workers=workers,
+                backend_sequence=backend_sequence,
+                challenge_name=challenge_name,
+                challenge_text=challenge_text,
+                category_hint=category_hint,
+                target_host=target_host,
+                final_state=final_state,
+            )
+        except Exception as exc:
+            _warn(f"writeup worker failed: {exc}")
+
+    writeup_path = workspace / "writeup.md"
+    writeup_path.write_text(
+        markdown
+        or _render_writeup_markdown(
+            challenge_name=challenge_name,
+            challenge_text=challenge_text,
+            category_hint=category_hint,
+            target_host=target_host,
+            final_state=final_state,
+        ),
+        encoding="utf-8",
+    )
 
 
-def _coalesce_target_host(raw: dict[str, object]) -> str | None:
-    direct = _coalesce_str(raw, "target_host", "target")
-    if direct:
-        return direct
+def _render_writeup_markdown(
+    challenge_name: str,
+    challenge_text: str,
+    category_hint: str | None,
+    target_host: str | None,
+    final_state: dict[str, Any],
+) -> str:
+    history = [item for item in final_state.get("history", []) if isinstance(item, dict)]
+    latest_output = final_state.get("latest_worker_output", {})
+    latest_commands = list(latest_output.get("commands", [])) if isinstance(latest_output, dict) else []
+    flag = str(final_state.get("final_flag") or "").strip()
+    summary = _compact_text(str(final_state.get("final_summary", "")))
+    approach_points = _build_writeup_approach_points(summary, history)
+    commands = _collect_writeup_commands(history, latest_commands)
+    script_snippets = _collect_writeup_scripts(history)
 
-    ip = _coalesce_str(raw, "ip")
-    port = raw.get("port")
-    if not ip:
-        return None
-    if isinstance(port, int):
-        return f"{ip}:{port}"
-    if isinstance(port, str) and port.strip():
-        return f"{ip}:{port.strip()}"
-    return ip
+    lines = [
+        "# Writeup",
+        "",
+        f"**Challenge:** {challenge_name}",
+    ]
+    if category_hint:
+        lines.append(f"**Category:** `{category_hint}`")
+    if target_host:
+        lines.append(f"**Target:** `{target_host}`")
+    if flag:
+        lines.append(f"**Flag:** `{flag}`")
+
+    lines.extend(
+        [
+            "",
+            "## Challenge",
+            "",
+            _compact_text(challenge_text, limit=600),
+            "",
+            "## Resolution",
+            "",
+        ]
+    )
+    lines.extend(f"- {point}" for point in approach_points)
+
+    lines.extend(
+        [
+            "",
+            "## Solve",
+            "",
+        ]
+    )
+    if commands:
+        lines.extend(
+            [
+                "```bash",
+                *commands,
+                "```",
+            ]
+        )
+    else:
+        lines.append("No shell commands were required to recover the flag.")
+
+    if script_snippets:
+        lines.extend(
+            [
+                "",
+                "## Scripts",
+                "",
+            ]
+        )
+        for index, snippet in enumerate(script_snippets, 1):
+            language = _guess_script_language(snippet)
+            lines.extend(
+                [
+                    f"### Script {index}",
+                    "",
+                    f"```{language}",
+                    snippet,
+                    "```",
+                    "",
+                ]
+            )
+        if lines[-1] == "":
+            lines.pop()
+
+    return "\n".join(lines).strip() + "\n"
 
 
-def _coalesce_artifacts(raw: dict[str, object]) -> list[str]:
-    for key in ("artifact_paths", "artifacts", "files"):
-        value = raw.get(key)
-        if isinstance(value, list):
-            return [str(item) for item in value]
-    return []
+def _build_writeup_approach_points(summary: str, history: list[dict[str, Any]]) -> list[str]:
+    points: list[str] = []
+    if summary:
+        points.append(summary)
+
+    for attempt in history[-3:]:
+        attempt_summary = _compact_text(str(attempt.get("summary", "")), limit=220)
+        if attempt_summary and attempt_summary not in points:
+            points.append(attempt_summary)
+        for evidence in attempt.get("evidence", []):
+            compact = _compact_text(str(evidence), limit=180)
+            if compact and compact not in points:
+                points.append(compact)
+            if len(points) >= 5:
+                return points
+    return points[:5] or ["The challenge was solved and the final flag was validated by the worker."]
+
+
+def _collect_writeup_commands(history: list[dict[str, Any]], latest_commands: list[str]) -> list[str]:
+    commands: list[str] = []
+    seen: set[str] = set()
+    for command in latest_commands:
+        compact = _compact_text(str(command), limit=500)
+        if compact and compact not in seen:
+            seen.add(compact)
+            commands.append(compact)
+    for attempt in reversed(history):
+        for command in attempt.get("key_commands", []):
+            compact = _compact_text(str(command), limit=500)
+            if compact and compact not in seen:
+                seen.add(compact)
+                commands.append(compact)
+            if len(commands) >= 8:
+                return commands
+    return commands
+
+
+def _collect_writeup_scripts(history: list[dict[str, Any]]) -> list[str]:
+    snippets: list[str] = []
+    seen: set[str] = set()
+    for attempt in reversed(history):
+        for item in attempt.get("inline_scripts", []):
+            if not isinstance(item, dict):
+                continue
+            snippet = _compact_text(str(item.get("snippet", "")), limit=1200, preserve_newlines=True)
+            if not snippet or snippet in seen:
+                continue
+            seen.add(snippet)
+            snippets.append(snippet)
+            if len(snippets) >= 3:
+                return snippets
+    return snippets
+
+
+def _compact_text(value: str, limit: int = 320, preserve_newlines: bool = False) -> str:
+    normalized = value.strip()
+    if not normalized:
+        return ""
+    if preserve_newlines:
+        lines = [" ".join(line.split()) for line in normalized.splitlines()]
+        compact = "\n".join(line for line in lines if line)
+    else:
+        compact = " ".join(normalized.split())
+    if len(compact) <= limit:
+        return compact
+    return f"{compact[: limit - 3].rstrip()}..."
+
+
+def _guess_script_language(snippet: str) -> str:
+    lowered = snippet.lstrip().lower()
+    if lowered.startswith("import ") or lowered.startswith("from "):
+        return "python"
+    if lowered.startswith("#!/usr/bin/env python") or lowered.startswith("#!/usr/bin/python"):
+        return "python"
+    return "text"
 
 
 def _extract_env_file_arg(argv: list[str]) -> Path | None:

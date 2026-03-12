@@ -1,72 +1,24 @@
 # CTF Destroyer
 
-PoC d'orchestration agentique pour challenges CTF.
+Orchestrateur agentique pour challenges CTF. Il prépare un workspace par challenge, route vers un skill adapté, lance un worker (`mock`, `codex`, `claude`), garde une mémoire de reprise locale, puis boucle jusqu'au flag ou jusqu'à la limite d'essais.
 
-Le projet utilise `LangGraph` comme orchestrateur et lance des workers spécialisés en subprocess, avec un focus actuel sur `codex`. L'objectif est simple: prendre un challenge, préparer un workspace isolé, choisir le bon skill, faire travailler un worker, tracer ce qu'il exécute, puis boucler jusqu'au flag ou jusqu'à une limite d'essais.
+## Ce que fait le projet
 
-## État du projet
-
-Le tool est encore un PoC, mais il fait déjà les choses suivantes:
-
-- normalisation d'entrées challenge hétérogènes
-- workspace dédié par challenge
-- copie locale et téléchargement HTTP(S) des artefacts
-- routage vers un skill CTF par catégorie
-- exécution de workers `mock`, `codex`, `claude`
-- boucle orchestrateur `route -> specialist -> evaluate`
-- capture des commandes et des sorties du worker
-- streaming temps réel des événements `codex --json`
-
-Ce n'est pas encore un orchestrateur multi-challenges complet.
-
-## Fonctionnement
-
-Cycle d'un run:
-
-1. le CLI charge un challenge JSON ou des arguments directs
-2. le challenge est normalisé
-3. un workspace local est créé sous `.challenges/<slug>-<hash>/`
-4. les artefacts sont copiés dans `artifacts/`
-   - chemins locaux: copie dans le workspace
-   - URLs `http(s)`: téléchargement automatique dans `artifacts/`
-5. le routeur choisit un skill spécialisé
-6. le worker sélectionné est lancé dans le workspace du challenge
-7. l'orchestrateur évalue le résultat et décide de stopper ou de relancer
-
-Le graphe LangGraph actuel est volontairement minimal:
-
-```text
-START
-  -> route
-  -> run_specialist
-  -> evaluate
-  -> END | run_specialist
-```
-
-## Structure
-
-```text
-ctf_destroyer/
-  cli.py         # point d'entrée
-  graph.py       # graphe LangGraph
-  skills.py      # chargement + routage des skills
-  workers.py     # workers mock/codex/claude
-  workspace.py   # staging du workspace challenge
-skills/
-  ...            # skills CTF locaux
-examples/
-  evaluative.json
-tests/
-  ...
-```
+- normalise des descriptions de challenge hétérogènes
+- crée un workspace isolé sous `.challenges/<slug>-<hash>/`
+- copie les artefacts locaux et télécharge les artefacts HTTP(S)
+- route vers un skill selon la catégorie
+- exécute des workers spécialisés avec un contrat de sortie commun
+- conserve l'historique, une mémoire de handoff et un `writeup.md`
+- peut publier le suivi dans un fil Discord dédié
 
 ## Pré-requis
 
 - Python `3.11+`
-- `codex` installé et authentifié pour utiliser le backend `codex`
-- `claude` installé et authentifié pour utiliser le backend `claude`
+- `codex` installé et authentifié pour le backend `codex`
+- `claude` installé et authentifié pour le backend `claude`
 
-Le projet tourne ici avec Python `3.14`, mais `langchain-core` émet un warning. Pour un setup plus propre, viser Python `3.12` ou `3.13`.
+Le projet tourne aussi avec Python `3.14`, mais un setup plus propre reste `3.12` ou `3.13`.
 
 ## Installation
 
@@ -76,9 +28,9 @@ python3 -m venv .venv
 pip install -e .
 ```
 
-## Utilisation rapide
+## Usage rapide
 
-Run local sans LLM:
+Run de test sans LLM:
 
 ```bash
 ctf-orchestrator \
@@ -87,23 +39,57 @@ ctf-orchestrator \
   --max-attempts 2
 ```
 
-Run avec `codex`:
+Run avec alternance de providers:
 
 ```bash
-CODEX_TIMEOUT_SECONDS=120 \
 ctf-orchestrator \
-  --challenge-file examples/evaluative.json \
-  --backend-sequence codex \
-  --max-attempts 1
+  --challenge-file examples/forbidden-fruit.json \
+  --backend-sequence claude,codex \
+  --max-attempts 10
 ```
 
-Run avec fallback `codex -> claude`:
+Run avec budget worker plus court:
 
 ```bash
+WORKER_TIMEOUT_SECONDS=300 \
+WORKER_PERMISSION_MODE=default \
 ctf-orchestrator \
   --challenge-file examples/evaluative.json \
-  --backend-sequence codex,claude \
-  --max-attempts 4
+  --backend-sequence codex
+```
+
+Importer un challenge depuis un texte collé:
+
+```bash
+pbpaste | ctf-import - --output examples/imported.json --review
+```
+
+Importer une page simple protégée par cookie de session:
+
+```bash
+ctf-import \
+  "https://ctf.example.com/challenges/noise-cheap" \
+  --session-cookie "abc123" \
+  --output examples/noise-cheap.json \
+  --review
+```
+
+Importer un challenge CTFd conteneurisé en démarrant l'instance avant l'export:
+
+```bash
+ctf-import \
+  --session-cookie "abc123" \
+  "https://ctf.example.com/challenges" \
+  --challenge "Glitch The Wired" \
+  --start-instance \
+  --output examples/glitch-the-wired.json
+```
+
+Lister plusieurs challenges détectés sur une même source:
+
+```bash
+ctf-import --input-file board.txt --list
+ctf-import --input-file board.txt --challenge "Noise Cheap" --stdout
 ```
 
 ## Format d'entrée
@@ -116,103 +102,181 @@ Le CLI sait normaliser les champs suivants:
 - `files`, `artifacts`, `artifact_paths`
 - `target_host` ou `ip` + `port`
 
-Exemple:
+Tous les autres champs sont conservés dans `challenge_metadata`.
+
+Exemple minimal:
 
 ```json
 {
-  "title": "Evaluative",
-  "category": "misc",
-  "description": "A rogue bot is malfunctioning, generating cryptic sequences that control secure data vaults.",
-  "target_host": "154.57.164.64:31748",
-  "difficulty": "Very Easy",
-  "points": 10,
-  "rating": 3.3,
-  "files": []
+  "title": "Forbidden Fruit",
+  "category": "crypto",
+  "description": "AES-GCM misuse challenge.",
+  "target_host": "aes.cryptohack.org:443",
+  "files": [
+    "https://aes.cryptohack.org/forbidden_fruit/",
+    "https://toadstyle.org/cryptopals/63.txt"
+  ],
+  "operator_hint": "Exploit AES-GCM nonce reuse. Avoid brute force."
 }
 ```
 
-Les champs non reconnus sont conservés dans `challenge_metadata`.
+Exemples fournis:
 
-## Workspace d'un challenge
+- [examples/evaluative.json](/Users/tj/Documents/CTF-Destroyer/examples/evaluative.json)
+- [examples/bruce-schneiers-password-part-2.json](/Users/tj/Documents/CTF-Destroyer/examples/bruce-schneiers-password-part-2.json)
+- [examples/forbidden-fruit.json](/Users/tj/Documents/CTF-Destroyer/examples/forbidden-fruit.json)
 
-Chaque challenge est exécuté dans un dossier isolé:
+## Import de challenges
+
+`ctf-import` convertit une source brute vers le format JSON du projet.
+
+Ce que la V1 couvre:
+
+- texte collé sur `stdin`
+- fichier texte local via `--input-file`
+- URL HTML simples
+- détection de plusieurs challenges dans une même source
+- sélection d'un challenge via `--challenge`
+- cookie de session brut via `--session-cookie` ou `--cookie-file`
+- import CTFd via API quand la board est accessible
+- récupération de `target_host` pour un challenge CTFd conteneurisé si l'instance est déjà démarrée dans l'UI
+- démarrage d'une instance CTFd conteneurisée via `--start-instance` quand la page source expose le `csrfNonce`
+
+Flags principaux:
+
+- `ctf-import <url>`
+- `ctf-import -`
+- `--input-file`
+- `--output`
+- `--stdout`
+- `--review`
+- `--list`
+- `--challenge`
+- `--session-cookie`
+- `--cookie-file`
+- `--start-instance`
+
+`--session-cookie` accepte soit une valeur nue de session Flask/CTFd, soit un header `Cookie` complet. Si tu lui passes seulement un token, `ctf-import` l'envoie comme `session=<token>`.
+
+`--start-instance` ne s'applique qu'à l'import CTFd. Le CLI réutilise d'abord l'instance courante si elle correspond déjà au challenge sélectionné; sinon il envoie le POST de démarrage CTFd puis poll `/api/v1/containers/current` pour récupérer `access` et remplir `target_host`.
+
+Si `--start-instance` a été demandé et qu'aucun `target_host` n'a pu être récupéré, `ctf-import` échoue explicitement avec un code de retour non nul et n'écrit pas un JSON inutilisable par défaut.
+
+`ctf-orchestrator` refuse aussi de démarrer un worker sur un challenge importé qui indique explicitement un échec d'accès d'instance après `--start-instance`.
+
+Limites actuelles de `ctf-import`:
+
+- pas encore de navigation browser ou clics dynamiques
+- pas encore d'extracteurs dédiés CryptoHack/CTFd
+- pas encore de suivi guidé de liens externes type SharePoint
+- pas encore de sélection par identifiant de challenge
+
+## Workspace et reprise
+
+Chaque challenge vit dans un dossier dédié:
 
 ```text
 .challenges/<slug>-<hash>/
 ```
 
-Ce dossier contient:
+Fichiers utiles:
 
 - `challenge.json`: manifeste normalisé
-- `artifacts/`: copie des fichiers fournis
-- `.runs/`: sorties et traces des workers
+- `artifacts/`: fichiers copiés ou téléchargés
+- `.runs/attempt-history.json`: historique des tentatives
+- `.runs/working-memory.json`: mémoire de reprise
+- `writeup.md`: writeup généré après résolution par un worker de rédaction dédié quand un backend réel est disponible, avec fallback local heuristique
+- `.discord-thread.json`: binding Discord local si l'intégration est activée
 
-Exemple:
+La reprise lit automatiquement l'historique et la mémoire locale avant un nouveau run.
 
-```text
-.challenges/evaluative-84c696b5/
-  challenge.json
-  artifacts/
-  .runs/
-```
+## Workers et config
 
-## Workers
+Les workers `codex` et `claude` partagent la même base de configuration côté orchestrateur:
 
-### `mock`
+- même prompt métier
+- même schéma de sortie structuré
+- même ordre via `--backend-sequence`
+- même famille de variables `WORKER_*`
+- même observabilité des commandes au niveau du projet
 
-Backend de test sans consommation de quota. Utile pour valider le graphe et les transitions d'état.
+Variables utiles:
 
-### `codex`
-
-Le worker `codex` utilise `codex exec` avec:
-
-- `--json` pour les événements détaillés
-- `--output-schema` pour forcer un JSON final
-- `-o` pour écrire le dernier message dans un fichier
-- `-C` pour exécuter dans le workspace du challenge
-
-Chaque tentative écrit:
-
-- le prompt dans `.runs/codex/attempt-XX-prompt.txt`
-- le schéma JSON dans `.runs/codex/attempt-XX-schema.json`
-- le flux d'événements dans `.runs/codex/attempt-XX-events.jsonl`
-
-Si `CODEX_STREAM_EVENTS=1`, les événements `command_execution` sont affichés en temps réel:
-
-```text
-[codex] start: /bin/zsh -lc ls
-[codex] done (0): /bin/zsh -lc ls
-```
-
-### `claude`
-
-Le worker `claude` utilise `claude -p` avec schéma JSON structuré. Il est branché, mais le plus gros du travail récent a été fait sur `codex`.
-
-## Variables d'environnement utiles
-
+- `WORKER_TIMEOUT_SECONDS`
+- `WORKER_PERMISSION_MODE`
+- `WORKER_STREAM_EVENTS`
 - `CODEX_MODEL`
 - `CODEX_SANDBOX`
 - `CODEX_APPROVAL_POLICY`
 - `CODEX_EXTRA_ARGS`
-- `CODEX_TIMEOUT_SECONDS`
-- `CODEX_STREAM_EVENTS`
 - `CLAUDE_MODEL`
-- `CLAUDE_PERMISSION_MODE`
 - `CLAUDE_EXTRA_ARGS`
-- `CLAUDE_TIMEOUT_SECONDS`
 
-Les timeouts worker par defaut sont maintenant plus longs (`1800s`) pour eviter de casser trop vite les runs difficiles. Les attempts suivantes reutilisent aussi une memoire structuree persistee par challenge dans le workspace, sous `.runs/working-memory.json`, avec:
+Les variables `WORKER_*` sont à privilégier pour une config provider-agnostic. Les variables `CODEX_*` et `CLAUDE_*` servent d'override spécifique provider.
 
-- constats confirms
-- pistes de faible valeur a eviter
-- commandes et scripts inline importants
-- fichiers de handoff a relire avant de repartir
+Valeurs possibles:
 
-Lorsqu'un challenge est relance apres un echec, l'orchestrateur recharge aussi `.runs/attempt-history.json`, fait une revue critique des tentatives precedentes, puis fournit au nouveau run:
+- `WORKER_TIMEOUT_SECONDS`: entier en secondes. Défaut `1800`.
+- `WORKER_PERMISSION_MODE`: mode provider-agnostic.
+  Valeurs recommandées:
+  `default`, `safe`, `never`, `dontAsk`, `dont-ask`, `dont_ask`
+  `auto`, `on-request`, `on_request`
+  `plan`, `readonly`, `read-only`, `read_only`, `untrusted`
+  `bypassPermissions`, `bypass_permissions`, `danger-full-access`, `danger_full_access`, `unrestricted`
+  `acceptEdits`, `accept_edits` pour Claude uniquement
+- `WORKER_STREAM_EVENTS`: booléen. `0`, `false`, `no`, `off` désactivent le streaming. Toute autre valeur non vide l'active. Défaut `true`.
+- `CODEX_MODEL`: nom de modèle passé à `codex -m`.
+- `CODEX_SANDBOX`: `read-only`, `workspace-write`, `danger-full-access`.
+  Alias acceptés par le projet: `seatbelt`, `sandbox`, `workspace` -> `workspace-write`.
+  Toute autre valeur retombe sur `workspace-write`.
+- `CODEX_APPROVAL_POLICY`: chaîne transmise au CLI Codex. En pratique, les valeurs utiles ici sont `never`, `on-request`, `untrusted`.
+- `CODEX_EXTRA_ARGS`: arguments additionnels passés tels quels à `codex`, sous forme de chaîne shell splittée.
+- `CLAUDE_MODEL`: nom de modèle passé à `claude --model`.
+- `CLAUDE_PERMISSION_MODE`: chaîne transmise au CLI Claude.
+  Valeurs utilisées par le projet: `default`, `dontAsk`, `auto`, `plan`, `bypassPermissions`, `acceptEdits`.
+- `CLAUDE_EXTRA_ARGS`: arguments additionnels passés tels quels à `claude`, sous forme de chaîne shell splittée.
 
-- les acquis a conserver
-- les chemins suspects ou deja sur-exploites
-- une consigne de reprise courte pour eviter de repartir dans les memes rabbit holes
+Mapping de `WORKER_PERMISSION_MODE`:
+
+- `default`, `safe`, `never`, `dontAsk` -> Codex `workspace-write` + `never`, Claude `dontAsk`
+- `auto`, `on-request` -> Codex `workspace-write` + `on-request`, Claude `auto`
+- `plan`, `readonly`, `read-only`, `untrusted` -> Codex `read-only` + `untrusted`, Claude `plan`
+- `bypassPermissions`, `danger-full-access`, `unrestricted` -> Codex `danger-full-access` + `never`, Claude `bypassPermissions`
+- `acceptEdits` -> Claude `acceptEdits`, mais Codex retombe sur le mode sûr par défaut
+
+## Discord
+
+Si `DISCORD_BOT_TOKEN` et `DISCORD_PARENT_CHANNEL_ID` sont définis, le CLI crée ou réutilise un fil Discord par challenge et y publie:
+
+- le message initial
+- le routage
+- chaque tentative
+- le résultat final
+- le contenu de `writeup.md` après un solve réussi
+
+Exemple:
+
+```bash
+export DISCORD_BOT_TOKEN=...
+export DISCORD_PARENT_CHANNEL_ID=123456789012345678
+
+ctf-orchestrator \
+  --challenge-file examples/forbidden-fruit.json \
+  --backend-sequence claude,codex
+```
+
+Flags associés:
+
+- `--discord-bot-token`
+- `--discord-parent-channel-id`
+- `--discord-auto-archive-duration`
+- `--env-file`
+
+Variables d'environnement Discord:
+
+- `DISCORD_BOT_TOKEN`: token du bot Discord
+- `DISCORD_PARENT_CHANNEL_ID`: ID du salon parent qui héberge les threads
+- `DISCORD_AUTO_ARCHIVE_DURATION`: une des valeurs `60`, `1440`, `4320`, `10080`
 
 ## Tests
 
@@ -223,54 +287,6 @@ Lorsqu'un challenge est relance apres un echec, l'orchestrateur recharge aussi `
 ## Limites actuelles
 
 - pas encore de parallélisme multi-challenges
-- pas encore de planificateur global de CTF entier
-- pas encore de persistance durable autre que le workspace local
-- pas encore d'UI live dédiée au-dessus du streaming stderr
-- pas encore d'exploitation automatique des `references/` des skills
-
-## Intégration Discord
-
-Le CLI peut maintenant créer ou réutiliser un fil Discord par challenge dans un salon dédié, puis publier:
-
-- le message initial du challenge
-- le résultat du routage (catégorie + skill)
-- chaque tentative worker
-- le résultat final
-
-Le mapping local est persistant dans:
-
-- `.challenges/<slug>-<hash>/.discord-thread.json`
-- `challenge.json` via le champ `discord_thread`
-
-Exemple avec un salon texte qui héberge des threads:
-
-```bash
-export DISCORD_BOT_TOKEN=...
-export DISCORD_PARENT_CHANNEL_ID=123456789012345678
-
-ctf-orchestrator \
-  --challenge-file examples/evaluative.json \
-  --backend-sequence mock
-```
-
-Variables d'environnement et flags disponibles:
-
-- `DISCORD_BOT_TOKEN` / `--discord-bot-token`
-- `DISCORD_PARENT_CHANNEL_ID` / `--discord-parent-channel-id`
-- `.env` à la racine est chargé automatiquement s'il existe
-- `--env-file chemin/.env` permet de charger un autre fichier
-
-Exemple de `.env`:
-
-```dotenv
-DISCORD_BOT_TOKEN=ton_bot_token
-DISCORD_PARENT_CHANNEL_ID=1480705892918755544
-```
-
-## Roadmap courte
-
-- orchestration de plusieurs challenges en parallèle
-- meilleure observabilité live
-- workers plus stricts sur la preuve d'exploitation
-- support plus riche des cibles réseau et des artefacts
-- stratégies de fallback entre workers spécialisés
+- pas encore de planificateur global
+- pas encore de persistance distante
+- pas encore d'UI live dédiée

@@ -189,6 +189,9 @@ class DiscordClient:
         if final_flag:
             lines.append(f"Final flag: `{final_flag}`")
         self.post_message(thread.thread_id, "\n".join(lines))
+        writeup_content = _load_writeup_content(final_state)
+        if writeup_content:
+            self.post_message(thread.thread_id, writeup_content)
 
     def post_message(self, thread_id: str, content: str) -> None:
         for chunk in _chunk_message(content):
@@ -316,3 +319,21 @@ def _truncate(value: str, limit: int) -> str:
     if len(compact) <= limit:
         return compact
     return f"{compact[: limit - 3].rstrip()}..."
+
+
+def _load_writeup_content(final_state: dict[str, Any]) -> str | None:
+    if not final_state.get("solved"):
+        return None
+
+    workspace = final_state.get("workspace")
+    if not workspace:
+        return None
+
+    writeup_path = Path(str(workspace)) / "writeup.md"
+    if not writeup_path.exists():
+        return None
+
+    content = writeup_path.read_text(encoding="utf-8").strip()
+    if not content:
+        return None
+    return content

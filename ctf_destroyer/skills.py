@@ -12,7 +12,7 @@ from yaml import YAMLError
 FRONT_MATTER_RE = re.compile(r"\A---\s*\n(.*?)\n---\s*\n?(.*)\Z", re.DOTALL)
 
 CATEGORY_KEYWORDS: dict[str, tuple[str, ...]] = {
-    "crypto": ("rsa", "xor", "cipher", "encrypt", "decrypt", "hash", "signature"),
+    "crypto": ("rsa", "xor", "cipher", "encrypt", "decrypt", "hash", "signature", "lattice", "lwe", "gcm"),
     "reverse": ("binary", "elf", "ghidra", "decompile", "bytecode", "crackme", "apk"),
     "web": ("http", "login", "cookie", "session", "jwt", "api", "sql", "xss", "ssrf"),
     "pwn": ("overflow", "format string", "heap", "rop", "shellcode", "uaf", "glibc"),

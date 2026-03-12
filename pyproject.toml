@@ -15,6 +15,7 @@ dependencies = [
 
 [project.scripts]
 ctf-orchestrator = "ctf_destroyer.cli:main"
+ctf-import = "ctf_destroyer.import_cli:main"
 
 [tool.setuptools.packages.find]
 include = ["ctf_destroyer*"]

@@ -1,6 +1,39 @@
+import os
+from pathlib import Path
 import unittest
+from unittest.mock import patch
 
-from ctf_destroyer.workers import CodexWorker, _compact_attempts_for_prompt, _format_codex_event_line
+from ctf_destroyer.skills import Skill
+from ctf_destroyer.workers import (
+    ClaudeWorker,
+    CodexWorker,
+    WorkerRequest,
+    _compact_attempts_for_prompt,
+    _format_claude_event_line,
+    _format_codex_event_line,
+)
+
+
+def _worker_request() -> WorkerRequest:
+    return WorkerRequest(
+        attempt_index=1,
+        challenge_name="Crypto Test",
+        challenge_text="Solve the challenge.",
+        challenge_category="crypto",
+        target_host=None,
+        metadata={},
+        artifact_paths=[],
+        workspace=Path("/tmp"),
+        skill=Skill(
+            slug="ctf-crypto-solver",
+            name="ctf-crypto-solver",
+            description="crypto",
+            instructions="Follow the crypto workflow.",
+            path=Path("/tmp/SKILL.md"),
+        ),
+        prior_attempts=[],
+        working_memory={},
+    )
 
 
 class WorkerTraceTest(unittest.TestCase):
@@ -21,14 +54,15 @@ class WorkerTraceTest(unittest.TestCase):
         self.assertEqual(commands, ["/bin/zsh -lc pwd", "/bin/zsh -lc ls"])
 
     def test_format_codex_event_line_for_console(self) -> None:
-        started = _format_codex_event_line(
-            '{"type":"item.started","item":{"id":"item_0","type":"command_execution","command":"/bin/zsh -lc pwd","status":"in_progress"}}'
-        )
-        completed = _format_codex_event_line(
-            '{"type":"item.completed","item":{"id":"item_0","type":"command_execution","command":"/bin/zsh -lc pwd","status":"completed","exit_code":0}}'
-        )
-        self.assertEqual(started, "[codex] start: /bin/zsh -lc pwd\n")
-        self.assertEqual(completed, "[codex] done (0): /bin/zsh -lc pwd\n")
+        with patch("ctf_destroyer.workers._current_worker_timestamp", return_value="14:23:01"):
+            started = _format_codex_event_line(
+                '{"type":"item.started","item":{"id":"item_0","type":"command_execution","command":"/bin/zsh -lc pwd","status":"in_progress"}}'
+            )
+            completed = _format_codex_event_line(
+                '{"type":"item.completed","item":{"id":"item_0","type":"command_execution","command":"/bin/zsh -lc pwd","status":"completed","exit_code":0}}'
+            )
+        self.assertEqual(started, "[14:23:01] [codex] start: /bin/zsh -lc pwd\n")
+        self.assertEqual(completed, "[14:23:01] [codex] done (0): /bin/zsh -lc pwd\n")
 
     def test_prompt_attempt_compaction_keeps_key_commands_and_inline_scripts(self) -> None:
         compacted = _compact_attempts_for_prompt(
@@ -49,6 +83,80 @@ class WorkerTraceTest(unittest.TestCase):
         self.assertEqual(len(compacted), 1)
         self.assertIn("python3 -c", compacted[0]["key_commands"][0])
         self.assertEqual(compacted[0]["inline_scripts"][0]["snippet"], "print('hello')")
+
+    def test_workers_share_provider_agnostic_defaults(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            codex = CodexWorker()
+            claude = ClaudeWorker()
+
+        self.assertEqual(codex.timeout_seconds, 1800)
+        self.assertEqual(claude.timeout_seconds, 1800)
+        self.assertEqual(codex.sandbox, "workspace-write")
+        self.assertEqual(codex.approval_policy, "never")
+        self.assertEqual(claude.permission_mode, "dontAsk")
+        self.assertTrue(codex.stream_events)
+        self.assertTrue(claude.stream_events)
+
+    def test_workers_honor_common_timeout_and_permission_mode(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"WORKER_TIMEOUT_SECONDS": "42", "WORKER_PERMISSION_MODE": "plan", "WORKER_STREAM_EVENTS": "1"},
+            clear=True,
+        ):
+            codex = CodexWorker()
+            claude = ClaudeWorker()
+
+        self.assertEqual(codex.timeout_seconds, 42)
+        self.assertEqual(claude.timeout_seconds, 42)
+        self.assertEqual((codex.sandbox, codex.approval_policy), ("read-only", "untrusted"))
+        self.assertEqual(claude.permission_mode, "plan")
+        self.assertTrue(codex.stream_events)
+        self.assertTrue(claude.stream_events)
+
+    def test_claude_command_does_not_duplicate_skill_instructions(self) -> None:
+        request = _worker_request()
+        with patch.dict(os.environ, {}, clear=True):
+            worker = ClaudeWorker()
+
+        command = worker._build_command(
+            request,
+            Path("/tmp/schema.json"),
+            Path("/tmp/output.json"),
+            "PROMPT BODY",
+        )
+
+        self.assertNotIn("--append-system-prompt", command)
+        self.assertEqual(command[-1], "PROMPT BODY")
+        self.assertIn("--verbose", command)
+        self.assertIn("stream-json", command)
+        self.assertIn("--no-session-persistence", command)
+
+    def test_claude_event_stream_extracts_commands(self) -> None:
+        event_stream = "\n".join(
+            [
+                '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"pwd"}}]}}',
+                '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok","is_error":false}]}}',
+            ]
+        )
+        worker = ClaudeWorker()
+        events = worker._extract_command_events(event_stream)
+        commands = worker._extract_commands_from_events(event_stream)
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["command"], "pwd")
+        self.assertEqual(events[0]["status"], "completed")
+        self.assertEqual(commands, ["pwd"])
+
+    def test_format_claude_event_line_for_console(self) -> None:
+        with patch("ctf_destroyer.workers._current_worker_timestamp", return_value="14:23:01"):
+            started = _format_claude_event_line(
+                '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"pwd"}}]}}'
+            )
+            completed = _format_claude_event_line(
+                '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok","is_error":false}]}}'
+            )
+        self.assertEqual(started, "[14:23:01] [claude] start: /bin/zsh -lc pwd\n")
+        self.assertEqual(completed, "[14:23:01] [claude] done (ok): toolu_1\n")
 
 
 if __name__ == "__main__":

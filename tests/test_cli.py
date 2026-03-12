@@ -2,8 +2,16 @@ import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
-from ctf_destroyer.cli import _load_env_file, _normalize_challenge_payload, parse_args
+from ctf_destroyer.cli import (
+    _load_env_file,
+    _maybe_write_writeup,
+    _normalize_challenge_payload,
+    _render_writeup_markdown,
+    _validate_challenge_actionability,
+    parse_args,
+)
 
 
 class CliNormalizationTest(unittest.TestCase):
@@ -75,6 +83,168 @@ class CliNormalizationTest(unittest.TestCase):
                     os.environ.pop("DISCORD_PARENT_CHANNEL_ID", None)
                 else:
                     os.environ["DISCORD_PARENT_CHANNEL_ID"] = original_channel
+
+    def test_render_writeup_includes_resolution_and_commands(self) -> None:
+        markdown = _render_writeup_markdown(
+            challenge_name="Bruce Test",
+            challenge_text="Recover the password from a structured search problem.",
+            category_hint="crypto",
+            target_host="socket.example:1234",
+            final_state={
+                "solved": True,
+                "final_flag": "flag{win}",
+                "final_summary": "Solved by narrowing the exact search, then validating the recovered password remotely.",
+                "latest_worker_output": {
+                    "commands": [
+                        "python3 solve.py --query",
+                        "nc socket.example 1234",
+                    ]
+                },
+                "history": [
+                    {
+                        "summary": "Built a smaller exact searcher around the surviving candidates.",
+                        "evidence": ["The previous broad search was pruned to a small candidate window."],
+                        "key_commands": ["python3 scan_exact_frontier.py --n 41 --limit 5"],
+                        "inline_scripts": [{"snippet": "from solve import ExactSearcher\nprint('ok')"}],
+                    }
+                ],
+            },
+        )
+
+        self.assertIn("# Writeup", markdown)
+        self.assertIn("## Resolution", markdown)
+        self.assertIn("## Solve", markdown)
+        self.assertIn("python3 solve.py --query", markdown)
+        self.assertIn("## Scripts", markdown)
+        self.assertIn("flag{win}", markdown)
+
+    def test_maybe_write_writeup_only_when_solved(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+
+            _maybe_write_writeup(
+                workspace=workspace,
+                challenge_name="Solved Challenge",
+                challenge_text="Inline flag challenge.",
+                category_hint="misc",
+                target_host=None,
+                final_state={
+                    "solved": True,
+                    "final_flag": "flag{inline}",
+                    "final_summary": "Recovered directly from the statement.",
+                    "latest_worker_output": {"commands": []},
+                    "history": [],
+                },
+            )
+            self.assertTrue((workspace / "writeup.md").exists())
+
+        with TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            _maybe_write_writeup(
+                workspace=workspace,
+                challenge_name="Unsolved Challenge",
+                challenge_text="No flag.",
+                category_hint="misc",
+                target_host=None,
+                final_state={
+                    "solved": False,
+                    "final_flag": None,
+                    "final_summary": "Not solved.",
+                    "latest_worker_output": {"commands": []},
+                    "history": [],
+                },
+            )
+            self.assertFalse((workspace / "writeup.md").exists())
+
+    def test_maybe_write_writeup_prefers_worker_generated_markdown(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            with patch(
+                "ctf_destroyer.cli.generate_writeup_markdown",
+                return_value="# Writeup\n\nSharper than the fallback.\n",
+            ) as mocked:
+                _maybe_write_writeup(
+                    workspace=workspace,
+                    challenge_name="Solved Challenge",
+                    challenge_text="Inline flag challenge.",
+                    category_hint="misc",
+                    target_host=None,
+                    final_state={
+                        "solved": True,
+                        "final_flag": "flag{inline}",
+                        "final_summary": "Recovered directly from the statement.",
+                        "latest_worker_output": {"commands": []},
+                        "history": [],
+                    },
+                    skills_root=Path("skills"),
+                    workers={"codex": object()},
+                    backend_sequence=["codex"],
+                )
+
+            self.assertEqual(
+                (workspace / "writeup.md").read_text(encoding="utf-8"),
+                "# Writeup\n\nSharper than the fallback.\n",
+            )
+            mocked.assert_called_once()
+
+    def test_maybe_write_writeup_falls_back_when_worker_returns_none(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            with patch("ctf_destroyer.cli.generate_writeup_markdown", return_value=None):
+                _maybe_write_writeup(
+                    workspace=workspace,
+                    challenge_name="Solved Challenge",
+                    challenge_text="Inline flag challenge.",
+                    category_hint="misc",
+                    target_host=None,
+                    final_state={
+                        "solved": True,
+                        "final_flag": "flag{inline}",
+                        "final_summary": "Recovered directly from the statement.",
+                        "latest_worker_output": {"commands": []},
+                        "history": [],
+                    },
+                    skills_root=Path("skills"),
+                    workers={"codex": object()},
+                    backend_sequence=["codex"],
+                )
+
+            markdown = (workspace / "writeup.md").read_text(encoding="utf-8")
+            self.assertIn("## Resolution", markdown)
+            self.assertIn("## Solve", markdown)
+
+    def test_validate_challenge_actionability_rejects_missing_instance_access(self) -> None:
+        with self.assertRaises(SystemExit) as context:
+            _validate_challenge_actionability(
+                "Operating Room",
+                None,
+                {
+                    "import_metadata": {
+                        "start_instance_requested": True,
+                        "start_instance_result": "failed",
+                        "warnings": [
+                            "Target host was not detected from the source.",
+                            "Container start request timed out before access became available: timed out",
+                        ],
+                    }
+                },
+            )
+
+        self.assertIn("not actionable", str(context.exception))
+        self.assertIn("start_instance_result=failed", str(context.exception))
+
+    def test_validate_challenge_actionability_allows_target_host_when_present(self) -> None:
+        _validate_challenge_actionability(
+            "Operating Room",
+            "espilon.net:35691",
+            {
+                "import_metadata": {
+                    "start_instance_requested": True,
+                    "start_instance_result": "reused_current",
+                    "warnings": [],
+                }
+            },
+        )
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, field
+from datetime import datetime
 import json
 import os
 from pathlib import Path
@@ -336,12 +337,11 @@ class SubprocessWorker(WorkerBackend, ABC):
 
 class CodexWorker(SubprocessWorker):
     def __init__(self) -> None:
-        super().__init__(name="codex", timeout_seconds=int(os.getenv("CODEX_TIMEOUT_SECONDS", "1800")))
+        super().__init__(name="codex", timeout_seconds=_resolve_worker_timeout_seconds("CODEX_TIMEOUT_SECONDS"))
         self.model = os.getenv("CODEX_MODEL", "")
-        self.sandbox = _normalize_codex_sandbox(os.getenv("CODEX_SANDBOX", "workspace-write"))
-        self.approval_policy = os.getenv("CODEX_APPROVAL_POLICY", "never")
+        self.sandbox, self.approval_policy = _resolve_codex_execution_policy()
         self.extra_args = shlex.split(os.getenv("CODEX_EXTRA_ARGS", ""))
-        self.stream_events = _env_flag("CODEX_STREAM_EVENTS", True)
+        self.stream_events = _resolve_worker_stream_events("CODEX_STREAM_EVENTS", True)
 
     def invoke(self, request: WorkerRequest) -> WorkerResult:
         if not self.stream_events:
@@ -533,10 +533,138 @@ class CodexWorker(SubprocessWorker):
 
 class ClaudeWorker(SubprocessWorker):
     def __init__(self) -> None:
-        super().__init__(name="claude", timeout_seconds=int(os.getenv("CLAUDE_TIMEOUT_SECONDS", "1800")))
+        super().__init__(name="claude", timeout_seconds=_resolve_worker_timeout_seconds("CLAUDE_TIMEOUT_SECONDS"))
         self.model = os.getenv("CLAUDE_MODEL", "")
-        self.permission_mode = os.getenv("CLAUDE_PERMISSION_MODE", "auto")
+        self.permission_mode = _resolve_claude_permission_mode()
         self.extra_args = shlex.split(os.getenv("CLAUDE_EXTRA_ARGS", ""))
+        self.stream_events = _resolve_worker_stream_events("CLAUDE_STREAM_EVENTS", True)
+
+    def invoke(self, request: WorkerRequest) -> WorkerResult:
+        if not self.stream_events:
+            return super().invoke(request)
+
+        run_dir = request.workspace / ".runs" / self.name
+        run_dir.mkdir(parents=True, exist_ok=True)
+        schema_path = run_dir / f"attempt-{request.attempt_index:02d}-schema.json"
+        output_path = run_dir / f"attempt-{request.attempt_index:02d}-output.json"
+        prompt_path = run_dir / f"attempt-{request.attempt_index:02d}-prompt.txt"
+        events_path = run_dir / f"attempt-{request.attempt_index:02d}-events.jsonl"
+        schema_path.write_text(json.dumps(RESULT_SCHEMA, indent=2), encoding="utf-8")
+        prompt = self._build_prompt(request)
+        prompt_path.write_text(prompt, encoding="utf-8")
+
+        command = self._build_command(request, schema_path, output_path, prompt)
+        stdout_chunks: list[str] = []
+        stderr_chunks: list[str] = []
+
+        process = subprocess.Popen(
+            command,
+            cwd=request.workspace,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+
+        stdout_thread = threading.Thread(
+            target=_read_stream_lines,
+            args=(process.stdout, stdout_chunks, self._emit_live_event),
+            daemon=True,
+        )
+        stderr_thread = threading.Thread(
+            target=_read_stream_lines,
+            args=(process.stderr, stderr_chunks, None),
+            daemon=True,
+        )
+        stdout_thread.start()
+        stderr_thread.start()
+
+        timed_out = False
+        try:
+            returncode = process.wait(timeout=self.timeout_seconds)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            process.kill()
+            returncode = None
+
+        stdout_thread.join()
+        stderr_thread.join()
+        stdout_text = "".join(stdout_chunks)
+        stderr_text = "".join(stderr_chunks)
+        if stdout_text:
+            events_path.write_text(stdout_text, encoding="utf-8")
+
+        stream_payload = self._extract_claude_stream_payload(stdout_text)
+        if stream_payload is not None:
+            output_path.write_text(json.dumps(stream_payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+        raw_output = (
+            json.dumps(stream_payload, ensure_ascii=False)
+            if stream_payload is not None
+            else self._read_output_file(output_path) or stdout_text or stderr_text
+        )
+        command_events = self._extract_command_events(stdout_text)
+        parsed = stream_payload or self._parse_if_possible(raw_output)
+
+        if timed_out:
+            if parsed is not None:
+                commands = _dedupe_strings(
+                    list(parsed.get("commands", [])) + self._extract_commands_from_events(stdout_text)
+                )
+                return WorkerResult(
+                    backend=self.name,
+                    status=parsed["status"],
+                    summary=parsed["summary"],
+                    next_step=parsed["next_step"],
+                    flag=parsed.get("flag"),
+                    evidence=list(parsed.get("evidence", [])),
+                    commands=commands,
+                    command_events=command_events,
+                    event_log_path=str(events_path) if stdout_text else "",
+                    raw_output=raw_output,
+                )
+            return WorkerResult(
+                backend=self.name,
+                status="blocked",
+                summary=f"{self.name} timed out after {self.timeout_seconds} seconds.",
+                next_step="Retry with a longer timeout or a narrower prompt.",
+                evidence=[(stderr_text or stdout_text or "No subprocess output before timeout.").strip()],
+                commands=_dedupe_strings(self._extract_commands_from_events(stdout_text)),
+                command_events=command_events,
+                event_log_path=str(events_path) if stdout_text else "",
+                raw_output=raw_output,
+            )
+
+        if returncode not in (0, None) and parsed is None:
+            return WorkerResult(
+                backend=self.name,
+                status="blocked",
+                summary=f"{self.name} exited with status {returncode}.",
+                next_step="Inspect stderr/stdout and adjust authentication or CLI flags.",
+                evidence=[(stderr_text or stdout_text or "No subprocess output.").strip()],
+                commands=_dedupe_strings(self._extract_commands_from_events(stdout_text)),
+                command_events=command_events,
+                event_log_path=str(events_path) if stdout_text else "",
+                raw_output=raw_output,
+            )
+
+        if parsed is None:
+            parsed = self._parse_structured_output(raw_output)
+        commands = _dedupe_strings(
+            list(parsed.get("commands", [])) + self._extract_commands_from_events(stdout_text)
+        )
+        return WorkerResult(
+            backend=self.name,
+            status=parsed["status"],
+            summary=parsed["summary"],
+            next_step=parsed["next_step"],
+            flag=parsed.get("flag"),
+            evidence=list(parsed.get("evidence", [])),
+            commands=commands,
+            command_events=command_events,
+            event_log_path=str(events_path) if stdout_text else "",
+            raw_output=raw_output,
+        )
 
     def _build_command(
         self,
@@ -548,20 +676,106 @@ class ClaudeWorker(SubprocessWorker):
         command = [
             "claude",
             "-p",
+            "--verbose",
             "--output-format",
-            "json",
+            "stream-json",
+            "--no-session-persistence",
             "--json-schema",
             json.dumps(RESULT_SCHEMA),
             "--permission-mode",
             self.permission_mode,
-            "--append-system-prompt",
-            request.skill.instructions,
         ]
         if self.model:
             command.extend(["--model", self.model])
         command.extend(self.extra_args)
         command.append(prompt)
         return command
+
+    def _extract_command_events(self, event_stream: str) -> list[dict[str, Any]]:
+        latest_by_id: dict[str, dict[str, Any]] = {}
+        ordered_ids: list[str] = []
+        for line in event_stream.splitlines():
+            payload = _safe_json_loads(line)
+            if not isinstance(payload, dict):
+                continue
+
+            if payload.get("type") == "assistant":
+                message = payload.get("message")
+                if not isinstance(message, dict):
+                    continue
+                for content_item in message.get("content", []):
+                    if not isinstance(content_item, dict) or content_item.get("type") != "tool_use":
+                        continue
+                    if content_item.get("name") != "Bash":
+                        continue
+                    item_id = str(content_item.get("id", len(ordered_ids)))
+                    latest_by_id[item_id] = {
+                        "id": item_id,
+                        "event_type": "tool_use",
+                        "command": str(content_item.get("input", {}).get("command", "")),
+                        "status": "in_progress",
+                        "exit_code": None,
+                        "output": "",
+                    }
+                    if item_id not in ordered_ids:
+                        ordered_ids.append(item_id)
+                continue
+
+            if payload.get("type") != "user":
+                continue
+            message = payload.get("message")
+            if not isinstance(message, dict):
+                continue
+            for content_item in message.get("content", []):
+                if not isinstance(content_item, dict) or content_item.get("type") != "tool_result":
+                    continue
+                item_id = str(content_item.get("tool_use_id", len(ordered_ids)))
+                previous = latest_by_id.get(
+                    item_id,
+                    {
+                        "id": item_id,
+                        "event_type": "tool_result",
+                        "command": "",
+                        "status": "",
+                        "exit_code": None,
+                        "output": "",
+                    },
+                )
+                is_error = bool(content_item.get("is_error"))
+                latest_by_id[item_id] = {
+                    **previous,
+                    "event_type": "tool_result",
+                    "status": "failed" if is_error else "completed",
+                    "exit_code": 1 if is_error else 0,
+                    "output": _coerce_claude_tool_result(content_item.get("content")),
+                }
+                if item_id not in ordered_ids:
+                    ordered_ids.append(item_id)
+
+        return [latest_by_id[item_id] for item_id in ordered_ids]
+
+    def _emit_live_event(self, line: str) -> None:
+        formatted = _format_claude_event_line(line)
+        if formatted:
+            sys.stderr.write(formatted)
+            sys.stderr.flush()
+
+    def _extract_claude_stream_payload(self, event_stream: str) -> dict[str, Any] | None:
+        for line in reversed(event_stream.splitlines()):
+            payload = _safe_json_loads(line)
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("type") != "result":
+                continue
+            structured_output = payload.get("structured_output")
+            if isinstance(structured_output, dict):
+                return structured_output
+            result = payload.get("result")
+            if isinstance(result, str):
+                parsed = _extract_json(result)
+                if isinstance(parsed, dict):
+                    return parsed
+        return None
 
 
 def _extract_json(raw_output: str) -> Any:
@@ -638,6 +852,96 @@ def _env_flag(name: str, default: bool) -> bool:
     return value.strip().lower() not in {"0", "false", "no", "off"}
 
 
+def _resolve_worker_timeout_seconds(provider_env: str, default: int = 1800) -> int:
+    value = _first_env_value("WORKER_TIMEOUT_SECONDS", provider_env)
+    if value is None:
+        return default
+    return int(value)
+
+
+def _resolve_worker_stream_events(provider_env: str, default: bool) -> bool:
+    if os.getenv("WORKER_STREAM_EVENTS") is not None:
+        return _env_flag("WORKER_STREAM_EVENTS", default)
+    if os.getenv(provider_env) is not None:
+        return _env_flag(provider_env, default)
+    return default
+
+
+def _resolve_codex_execution_policy() -> tuple[str, str]:
+    common_mode = _first_env_value("WORKER_PERMISSION_MODE")
+    if common_mode is not None:
+        return _map_common_permission_mode_to_codex(common_mode)
+
+    sandbox = os.getenv("CODEX_SANDBOX")
+    approval_policy = os.getenv("CODEX_APPROVAL_POLICY")
+    if sandbox is not None or approval_policy is not None:
+        return _normalize_codex_sandbox(sandbox or "workspace-write"), (approval_policy or "never").strip() or "never"
+
+    return "workspace-write", "never"
+
+
+def _resolve_claude_permission_mode() -> str:
+    common_mode = _first_env_value("WORKER_PERMISSION_MODE")
+    if common_mode is not None:
+        return _map_common_permission_mode_to_claude(common_mode)
+
+    permission_mode = os.getenv("CLAUDE_PERMISSION_MODE")
+    if permission_mode is not None:
+        return permission_mode.strip() or "dontAsk"
+
+    return "dontAsk"
+
+
+def _map_common_permission_mode_to_codex(value: str) -> tuple[str, str]:
+    normalized = value.strip().lower()
+    if normalized in {"dontask", "dont-ask", "dont_ask", "never", "safe", "default"}:
+        return "workspace-write", "never"
+    if normalized in {"auto", "on-request", "on_request"}:
+        return "workspace-write", "on-request"
+    if normalized in {"plan", "readonly", "read-only", "read_only", "untrusted"}:
+        return "read-only", "untrusted"
+    if normalized in {
+        "bypasspermissions",
+        "bypass_permissions",
+        "danger-full-access",
+        "danger_full_access",
+        "unrestricted",
+    }:
+        return "danger-full-access", "never"
+    return "workspace-write", "never"
+
+
+def _map_common_permission_mode_to_claude(value: str) -> str:
+    normalized = value.strip().lower()
+    if normalized in {"dontask", "dont-ask", "dont_ask", "never", "safe"}:
+        return "dontAsk"
+    if normalized in {"auto", "on-request", "on_request"}:
+        return "auto"
+    if normalized in {"plan", "readonly", "read-only", "read_only", "untrusted"}:
+        return "plan"
+    if normalized in {
+        "bypasspermissions",
+        "bypass_permissions",
+        "danger-full-access",
+        "danger_full_access",
+        "unrestricted",
+    }:
+        return "bypassPermissions"
+    if normalized in {"acceptedits", "accept_edits"}:
+        return "acceptEdits"
+    if normalized == "default":
+        return "default"
+    return "dontAsk"
+
+
+def _first_env_value(*names: str) -> str | None:
+    for name in names:
+        value = os.getenv(name)
+        if value is not None:
+            return value
+    return None
+
+
 def _read_stream_lines(
     stream: Any,
     collector: list[str],
@@ -670,11 +974,53 @@ def _format_codex_event_line(line: str) -> str | None:
         return None
     event_type = payload.get("type")
     if event_type == "item.started":
-        return f"[codex] start: {command}\n"
+        return _prefix_worker_event_line("codex", f"start: {command}")
     if event_type == "item.completed":
         exit_code = item.get("exit_code")
-        return f"[codex] done ({exit_code}): {command}\n"
+        return _prefix_worker_event_line("codex", f"done ({exit_code}): {command}")
     return None
+
+
+def _format_claude_event_line(line: str) -> str | None:
+    payload = _safe_json_loads(line)
+    if not isinstance(payload, dict):
+        return None
+
+    if payload.get("type") == "assistant":
+        message = payload.get("message")
+        if not isinstance(message, dict):
+            return None
+        for content_item in message.get("content", []):
+            if not isinstance(content_item, dict) or content_item.get("type") != "tool_use":
+                continue
+            if content_item.get("name") != "Bash":
+                continue
+            command = str(content_item.get("input", {}).get("command", "")).strip()
+            if command:
+                return _prefix_worker_event_line("claude", f"start: /bin/zsh -lc {command}")
+        return None
+
+    if payload.get("type") != "user":
+        return None
+    message = payload.get("message")
+    if not isinstance(message, dict):
+        return None
+    for content_item in message.get("content", []):
+        if not isinstance(content_item, dict) or content_item.get("type") != "tool_result":
+            continue
+        status = "error" if content_item.get("is_error") else "ok"
+        tool_use_id = str(content_item.get("tool_use_id", ""))
+        if tool_use_id:
+            return _prefix_worker_event_line("claude", f"done ({status}): {tool_use_id}")
+    return None
+
+
+def _prefix_worker_event_line(worker_name: str, message: str) -> str:
+    return f"[{_current_worker_timestamp()}] [{worker_name}] {message}\n"
+
+
+def _current_worker_timestamp() -> str:
+    return datetime.now().strftime("%H:%M:%S")
 
 
 def _compact_attempts_for_prompt(prior_attempts: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -703,3 +1049,31 @@ def _truncate_for_prompt(value: str, limit: int) -> str:
     if len(compact) <= limit:
         return compact
     return f"{compact[: limit - 3].rstrip()}..."
+
+
+def _safe_json_loads(value: str) -> Any:
+    try:
+        return json.loads(value)
+    except Exception:
+        return None
+
+
+def _coerce_claude_tool_result(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts: list[str] = []
+        for item in value:
+            if isinstance(item, str):
+                parts.append(item)
+                continue
+            if isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+                    continue
+                nested = item.get("content")
+                if isinstance(nested, str):
+                    parts.append(nested)
+        return "\n".join(part for part in parts if part)
+    return str(value)
