@@ -1,6 +1,7 @@
 # CTF Destroyer
 
 Orchestrateur agentique pour challenges CTF.
+
 Attention cet outil à de fortes chances de détruire vos tokens et l'environnement qui l'héberge, en infligeant à l'utilisateur une dette cognitive conséquente et / ou un syndrome de l'imposteur remarquable. 
 
 Le projet prend un challenge normalise, prepare un workspace dedie, route vers un skill CTF adapte, lance un worker (`mock`, `codex`, `claude`), conserve la memoire locale de reprise et produit un `writeup.md` quand un challenge est resolu.
