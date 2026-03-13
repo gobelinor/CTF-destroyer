@@ -1,22 +1,14 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import replace
 import json
 from pathlib import Path
 import sys
 
 from .cli import _extract_env_file_arg, _load_env_file
-from .importers import (
-    ImportRequest,
-    discover_text_challenges,
-    import_ctfd_challenge,
-    load_source_document,
-    render_import_review,
-    select_text_challenge,
-    try_discover_ctfd_challenges,
-)
-from .importers.text import import_text_challenge, list_discovered_challenges
+from .import_service import import_selected_candidates, load_board_context, validate_instance_access
+from .importers import ImportRequest, render_import_review
+from .importers.text import list_discovered_challenges
 from .workspace import _slugify
 
 
@@ -73,21 +65,32 @@ def main(argv: list[str] | None = None) -> int:
         cookie_file=args.cookie_file.resolve() if args.cookie_file else None,
         start_instance=bool(args.start_instance),
     )
-    document = load_source_document(import_request)
-    candidates = try_discover_ctfd_challenges(document, import_request) or discover_text_challenges(document)
-    candidates = _annotate_candidates_for_listing(candidates, document, import_request)
+    context = load_board_context(import_request)
 
     if args.list:
-        print(list_discovered_challenges(candidates))
+        print(list_discovered_challenges(context.candidates))
         return 0
 
-    selected = select_text_challenge(candidates, args.challenge)
-    imported = import_ctfd_challenge(selected, document, import_request) or import_text_challenge(selected, document)
-    payload = imported.to_payload()
+    records = import_selected_candidates(
+        context,
+        queries=[args.challenge] if args.challenge else None,
+        start_instance=bool(args.start_instance),
+    )
+    if not records:
+        raise SystemExit("No challenge-like content was detected in the source.")
+    if len(records) != 1:
+        raise SystemExit("ctf-import requires a single selected challenge when not using --list.")
+
+    record = records[0]
+    imported = record.imported
+    payload = record.payload
+    if imported is None or payload is None:
+        print(f"[error] {record.error or 'challenge import failed'}", file=sys.stderr)
+        return 2
 
     if import_request.review:
         print(render_import_review(imported), file=sys.stderr)
-    instance_error = _validate_instance_access(import_request, imported)
+    instance_error = validate_instance_access(import_request, imported)
     if instance_error:
         print(f"[error] {instance_error}", file=sys.stderr)
         return 2
@@ -109,52 +112,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-
-
-def _annotate_candidates_for_listing(
-    candidates,
-    document,
-    import_request,
-):
-    inspect_request = replace(import_request, start_instance=False)
-    annotated = []
-    for candidate in candidates:
-        warnings = list(getattr(candidate, "warnings", []))
-        try:
-            imported = import_ctfd_challenge(candidate, document, inspect_request)
-            if imported is None:
-                imported = import_text_challenge(candidate, document)
-            warnings = list(imported.warnings)
-        except Exception:
-            pass
-        annotated.append(
-            type(candidate)(
-                title=candidate.title,
-                text_block=candidate.text_block,
-                challenge_id=candidate.challenge_id,
-                category=candidate.category,
-                points=candidate.points,
-                solves=candidate.solves,
-                source_label=candidate.source_label,
-                warnings=warnings,
-            )
-        )
-    return annotated
-
-
-def _validate_instance_access(import_request: ImportRequest, imported) -> str | None:
-    if not import_request.start_instance:
-        return None
-    if imported.target_host:
-        return None
-
-    metadata = imported.import_metadata if isinstance(imported.import_metadata, dict) else {}
-    start_result = str(metadata.get("start_instance_result") or "unknown")
-    details = list(imported.warnings)
-    detail_suffix = ""
-    if details:
-        detail_suffix = f" Details: {'; '.join(details)}"
-    return (
-        f"failed to acquire instance access for '{imported.title}' "
-        f"(start_instance_result={start_result}).{detail_suffix}"
-    )

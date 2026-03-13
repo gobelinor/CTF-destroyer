@@ -18,7 +18,7 @@ warnings.filterwarnings(
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 
-from .skills import Skill, load_skills, resolve_specialist_skill, route_category
+from .skills import Skill, load_skills, resolve_core_skill, resolve_specialist_skill, route_category
 from .workers import WorkerRequest, WorkerResult, WorkerBackend, extract_flag
 
 
@@ -31,6 +31,8 @@ class ChallengeState(TypedDict, total=False):
     target_host: str | None
     category: str
     category_reason: str
+    core_skill_slug: str | None
+    core_skill_path: str | None
     specialist_skill_slug: str
     specialist_skill_path: str
     backend_sequence: list[str]
@@ -72,10 +74,13 @@ def build_orchestrator(
             ),
             state.get("category_hint"),
         )
+        core_skill = resolve_core_skill(skills)
         skill = resolve_specialist_skill(category, skills)
         payload = {
             "category": category,
             "category_reason": reason,
+            "core_skill_slug": core_skill.slug if core_skill else None,
+            "core_skill_path": str(core_skill.path) if core_skill else None,
             "specialist_skill_slug": skill.slug,
             "specialist_skill_path": str(skill.path),
             "backend_index": state.get("backend_index", 0),
@@ -93,6 +98,8 @@ def build_orchestrator(
             {
                 "category": category,
                 "category_reason": reason,
+                "core_skill_slug": core_skill.slug if core_skill else None,
+                "core_skill_path": str(core_skill.path) if core_skill else None,
                 "specialist_skill_slug": skill.slug,
                 "specialist_skill_path": str(skill.path),
             },
@@ -100,6 +107,7 @@ def build_orchestrator(
         return payload
 
     def specialist_node(state: ChallengeState) -> dict[str, Any]:
+        core_skill = _get_skill(skills, state["core_skill_slug"]) if state.get("core_skill_slug") else None
         skill = _get_skill(skills, state["specialist_skill_slug"])
         sequence = state["backend_sequence"]
         backend_index = state.get("backend_index", 0) % len(sequence)
@@ -108,7 +116,7 @@ def build_orchestrator(
             attempt_index=state.get("attempts", 0) + 1,
             challenge_name=state["challenge_name"],
             challenge_text=state["challenge_text"],
-            challenge_category=state.get("category_hint"),
+            challenge_category=state.get("category"),
             target_host=state.get("target_host"),
             metadata=dict(state.get("challenge_metadata", {})),
             artifact_paths=list(state.get("artifact_paths", [])),
@@ -116,8 +124,12 @@ def build_orchestrator(
             skill=skill,
             prior_attempts=list(state.get("history", [])),
             working_memory=dict(state.get("working_memory", _empty_working_memory())),
+            core_skill=core_skill,
         )
-        result = workers[backend_name].invoke(request)
+        result = workers[backend_name].invoke(
+            request,
+            event_sink=lambda worker_event_type, payload: _emit_event(event_handler, worker_event_type, payload),
+        )
         history = list(state.get("history", []))
         attempt_record = _build_attempt_record(request, result)
         history.append(attempt_record)

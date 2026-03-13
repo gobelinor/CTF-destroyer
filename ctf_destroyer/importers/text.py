@@ -243,12 +243,17 @@ def _infer_category(title: str, description: str, target_host: str | None) -> st
 
 def _suggest_operator_hint(category: str, has_target: bool, has_files: bool) -> str:
     base_by_category = {
+        "blockchain": "Rebuild the contract state and call flow first; avoid spraying transactions before you understand permissions and storage.",
+        "cloud": "Identify the current identity, credentials, and scope first; do not enumerate whole tenants or accounts blindly.",
         "crypto": "Read the provided material first, recover the primitive and parameters, and avoid brute force.",
         "web": "Map the request flow and trust boundaries first; do not fuzz blindly before understanding the app.",
         "pwn": "Read the binary and the interface first, then script the interaction instead of guessing by hand.",
         "reverse": "Inspect the artifact before touching the remote endpoint and reduce the logic to a small reproducible script.",
         "forensics": "Build a minimal extraction pipeline from the provided artifacts before exploring side paths.",
+        "hardware": "Start from the provided dumps, firmware, captures, or signal files before inventing physical attack paths.",
+        "jail": "Classify the sandbox constraints first and build a tiny local harness before trying larger escape payloads.",
         "osint": "Collect the explicit clues first and keep the pivot chain tight instead of wandering across the internet.",
+        "mobile": "Triage the mobile artifact locally first; extract endpoints, storage, and exported surfaces before dynamic instrumentation.",
         "stego": "Inspect formats and metadata before trying broad extraction tools or guesswork.",
         "misc": "Read the provided material first and reduce the problem to a short reproducible script before experimenting widely.",
     }

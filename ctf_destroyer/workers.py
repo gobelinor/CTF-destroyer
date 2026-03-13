@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
 import shlex
 import subprocess
 import sys
@@ -50,6 +51,7 @@ class WorkerRequest:
     skill: Skill
     prior_attempts: list[dict[str, Any]]
     working_memory: dict[str, Any]
+    core_skill: Skill | None = None
 
 
 @dataclass(frozen=True)
@@ -88,14 +90,22 @@ class WorkerBackend(ABC):
     name: str
 
     @abstractmethod
-    def invoke(self, request: WorkerRequest) -> WorkerResult:
+    def invoke(
+        self,
+        request: WorkerRequest,
+        event_sink: Any = None,
+    ) -> WorkerResult:
         raise NotImplementedError
 
 
 class MockWorker(WorkerBackend):
     name = "mock"
 
-    def invoke(self, request: WorkerRequest) -> WorkerResult:
+    def invoke(
+        self,
+        request: WorkerRequest,
+        event_sink: Any = None,
+    ) -> WorkerResult:
         flag_match = FLAG_RE.search(request.challenge_text)
         if flag_match:
             return WorkerResult(
@@ -139,7 +149,11 @@ class SubprocessWorker(WorkerBackend, ABC):
         self.name = name
         self.timeout_seconds = timeout_seconds
 
-    def invoke(self, request: WorkerRequest) -> WorkerResult:
+    def invoke(
+        self,
+        request: WorkerRequest,
+        event_sink: Any = None,
+    ) -> WorkerResult:
         run_dir = request.workspace / ".runs" / self.name
         run_dir.mkdir(parents=True, exist_ok=True)
         schema_path = run_dir / f"attempt-{request.attempt_index:02d}-schema.json"
@@ -244,6 +258,18 @@ class SubprocessWorker(WorkerBackend, ABC):
         )
         artifacts = "\n".join(f"- {path}" for path in request.artifact_paths) or "- none"
         metadata = json.dumps(request.metadata, indent=2, ensure_ascii=False) if request.metadata else "{}"
+        core_skill_section = ""
+        if request.core_skill is not None:
+            core_skill_section = textwrap.dedent(
+                f"""
+                Core methodology skill: {request.core_skill.name}
+                Core methodology description: {request.core_skill.description}
+
+                Core methodology instructions:
+                {request.core_skill.instructions}
+
+                """
+            )
         return textwrap.dedent(
             f"""
             Challenge name: {request.challenge_name}
@@ -267,14 +293,15 @@ class SubprocessWorker(WorkerBackend, ABC):
             Structured handoff memory:
             {working_memory}
 
-            Specialist skill: {request.skill.name}
-            Skill description: {request.skill.description}
+            {core_skill_section}Specialist skill: {request.skill.name}
+            Specialist skill description: {request.skill.description}
 
-            Skill instructions:
+            Specialist skill instructions:
             {request.skill.instructions}
 
             Objective:
             - Solve the CTF challenge if possible.
+            - Apply the core methodology first, then the specialist workflow.
             - You may execute shell commands inside the workspace when needed.
             - If a target host is provided, prefer direct interaction with it using shell tools before relying on external references.
             - Treat the workspace as persistent across attempts. Reuse existing scripts, logs and notes before restarting naive reconnaissance.
@@ -343,9 +370,13 @@ class CodexWorker(SubprocessWorker):
         self.extra_args = shlex.split(os.getenv("CODEX_EXTRA_ARGS", ""))
         self.stream_events = _resolve_worker_stream_events("CODEX_STREAM_EVENTS", True)
 
-    def invoke(self, request: WorkerRequest) -> WorkerResult:
+    def invoke(
+        self,
+        request: WorkerRequest,
+        event_sink: Any = None,
+    ) -> WorkerResult:
         if not self.stream_events:
-            return super().invoke(request)
+            return super().invoke(request, event_sink=event_sink)
 
         run_dir = request.workspace / ".runs" / self.name
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -369,6 +400,7 @@ class CodexWorker(SubprocessWorker):
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
+            **_streaming_popen_kwargs(),
         )
         stdin_payload = self._stdin_payload(prompt)
         if stdin_payload is not None and process.stdin is not None:
@@ -377,7 +409,7 @@ class CodexWorker(SubprocessWorker):
 
         stdout_thread = threading.Thread(
             target=_read_stream_lines,
-            args=(process.stdout, stdout_chunks, self._emit_live_event),
+            args=(process.stdout, stdout_chunks, lambda line: self._emit_live_event(line, event_sink)),
             daemon=True,
         )
         stderr_thread = threading.Thread(
@@ -393,13 +425,14 @@ class CodexWorker(SubprocessWorker):
             returncode = process.wait(timeout=self.timeout_seconds)
         except subprocess.TimeoutExpired:
             timed_out = True
-            process.kill()
+            _terminate_process_tree(process)
             returncode = None
 
-        stdout_thread.join()
-        stderr_thread.join()
+        stream_join_warnings = _join_stream_threads(stdout_thread, stderr_thread)
         stdout_text = "".join(stdout_chunks)
         stderr_text = "".join(stderr_chunks)
+        if stream_join_warnings:
+            stderr_text = "\n".join(stream_join_warnings + ([stderr_text] if stderr_text else []))
         if stdout_text:
             events_path.write_text(stdout_text, encoding="utf-8")
 
@@ -524,11 +557,15 @@ class CodexWorker(SubprocessWorker):
                 ordered_ids.append(item_id)
         return [latest_by_id[item_id] for item_id in ordered_ids]
 
-    def _emit_live_event(self, line: str) -> None:
+    def _emit_live_event(self, line: str, event_sink: Any = None) -> None:
         formatted = _format_codex_event_line(line)
         if formatted:
             sys.stderr.write(formatted)
             sys.stderr.flush()
+        event = _extract_codex_live_command_event(line)
+        if event and event_sink is not None:
+            event_type, payload = event
+            event_sink(event_type, payload)
 
 
 class ClaudeWorker(SubprocessWorker):
@@ -539,9 +576,13 @@ class ClaudeWorker(SubprocessWorker):
         self.extra_args = shlex.split(os.getenv("CLAUDE_EXTRA_ARGS", ""))
         self.stream_events = _resolve_worker_stream_events("CLAUDE_STREAM_EVENTS", True)
 
-    def invoke(self, request: WorkerRequest) -> WorkerResult:
+    def invoke(
+        self,
+        request: WorkerRequest,
+        event_sink: Any = None,
+    ) -> WorkerResult:
         if not self.stream_events:
-            return super().invoke(request)
+            return super().invoke(request, event_sink=event_sink)
 
         run_dir = request.workspace / ".runs" / self.name
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -564,11 +605,13 @@ class ClaudeWorker(SubprocessWorker):
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
+            **_streaming_popen_kwargs(),
         )
 
+        live_state: dict[str, str] = {}
         stdout_thread = threading.Thread(
             target=_read_stream_lines,
-            args=(process.stdout, stdout_chunks, self._emit_live_event),
+            args=(process.stdout, stdout_chunks, lambda line: self._emit_live_event(line, event_sink, live_state)),
             daemon=True,
         )
         stderr_thread = threading.Thread(
@@ -584,13 +627,14 @@ class ClaudeWorker(SubprocessWorker):
             returncode = process.wait(timeout=self.timeout_seconds)
         except subprocess.TimeoutExpired:
             timed_out = True
-            process.kill()
+            _terminate_process_tree(process)
             returncode = None
 
-        stdout_thread.join()
-        stderr_thread.join()
+        stream_join_warnings = _join_stream_threads(stdout_thread, stderr_thread)
         stdout_text = "".join(stdout_chunks)
         stderr_text = "".join(stderr_chunks)
+        if stream_join_warnings:
+            stderr_text = "\n".join(stream_join_warnings + ([stderr_text] if stderr_text else []))
         if stdout_text:
             events_path.write_text(stdout_text, encoding="utf-8")
 
@@ -754,11 +798,20 @@ class ClaudeWorker(SubprocessWorker):
 
         return [latest_by_id[item_id] for item_id in ordered_ids]
 
-    def _emit_live_event(self, line: str) -> None:
+    def _emit_live_event(
+        self,
+        line: str,
+        event_sink: Any = None,
+        live_state: dict[str, str] | None = None,
+    ) -> None:
         formatted = _format_claude_event_line(line)
         if formatted:
             sys.stderr.write(formatted)
             sys.stderr.flush()
+        event = _extract_claude_live_command_event(line, live_state or {})
+        if event and event_sink is not None:
+            event_type, payload = event
+            event_sink(event_type, payload)
 
     def _extract_claude_stream_payload(self, event_stream: str) -> dict[str, Any] | None:
         for line in reversed(event_stream.splitlines()):
@@ -865,6 +918,36 @@ def _resolve_worker_stream_events(provider_env: str, default: bool) -> bool:
     if os.getenv(provider_env) is not None:
         return _env_flag(provider_env, default)
     return default
+
+
+def _streaming_popen_kwargs() -> dict[str, Any]:
+    if os.name == "nt":
+        return {}
+    return {"start_new_session": True}
+
+
+def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
+    if os.name != "nt":
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+            return
+        except (ProcessLookupError, PermissionError, AttributeError):
+            pass
+    try:
+        process.kill()
+    except ProcessLookupError:
+        pass
+
+
+def _join_stream_threads(*threads: threading.Thread, timeout_seconds: float = 5.0) -> list[str]:
+    warnings: list[str] = []
+    for thread in threads:
+        thread.join(timeout=timeout_seconds)
+        if thread.is_alive():
+            warnings.append(
+                f"stream reader thread '{thread.name or 'unnamed'}' did not exit after {timeout_seconds:.0f}s."
+            )
+    return warnings
 
 
 def _resolve_codex_execution_policy() -> tuple[str, str]:
@@ -981,6 +1064,33 @@ def _format_codex_event_line(line: str) -> str | None:
     return None
 
 
+def _extract_codex_live_command_event(line: str) -> tuple[str, dict[str, Any]] | None:
+    line = line.strip()
+    if not line:
+        return None
+    try:
+        payload = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    item = payload.get("item")
+    if not isinstance(item, dict) or item.get("type") != "command_execution":
+        return None
+    command = str(item.get("command", "")).strip()
+    if not command:
+        return None
+    event_type = payload.get("type")
+    data = {
+        "backend": "codex",
+        "command": command,
+        "exit_code": item.get("exit_code"),
+    }
+    if event_type == "item.started":
+        return "worker_command_started", data
+    if event_type == "item.completed":
+        return "worker_command_completed", data
+    return None
+
+
 def _format_claude_event_line(line: str) -> str | None:
     payload = _safe_json_loads(line)
     if not isinstance(payload, dict):
@@ -1012,6 +1122,59 @@ def _format_claude_event_line(line: str) -> str | None:
         tool_use_id = str(content_item.get("tool_use_id", ""))
         if tool_use_id:
             return _prefix_worker_event_line("claude", f"done ({status}): {tool_use_id}")
+    return None
+
+
+def _extract_claude_live_command_event(
+    line: str,
+    live_state: dict[str, str],
+) -> tuple[str, dict[str, Any]] | None:
+    payload = _safe_json_loads(line)
+    if not isinstance(payload, dict):
+        return None
+
+    if payload.get("type") == "assistant":
+        message = payload.get("message")
+        if not isinstance(message, dict):
+            return None
+        for content_item in message.get("content", []):
+            if not isinstance(content_item, dict) or content_item.get("type") != "tool_use":
+                continue
+            if content_item.get("name") != "Bash":
+                continue
+            tool_use_id = str(content_item.get("id", ""))
+            command = str(content_item.get("input", {}).get("command", "")).strip()
+            if not tool_use_id or not command:
+                continue
+            live_state[tool_use_id] = command
+            return (
+                "worker_command_started",
+                {
+                    "backend": "claude",
+                    "command": f"/bin/zsh -lc {command}",
+                    "exit_code": None,
+                },
+            )
+        return None
+
+    if payload.get("type") != "user":
+        return None
+    message = payload.get("message")
+    if not isinstance(message, dict):
+        return None
+    for content_item in message.get("content", []):
+        if not isinstance(content_item, dict) or content_item.get("type") != "tool_result":
+            continue
+        tool_use_id = str(content_item.get("tool_use_id", ""))
+        command = live_state.get(tool_use_id, tool_use_id)
+        return (
+            "worker_command_completed",
+            {
+                "backend": "claude",
+                "command": f"/bin/zsh -lc {command}" if not command.startswith("/bin/") else command,
+                "exit_code": 1 if content_item.get("is_error") else 0,
+            },
+        )
     return None
 
 

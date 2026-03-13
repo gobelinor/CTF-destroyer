@@ -1,13 +1,15 @@
+---
 name: ctf-category-router
-description: Routage initial de tout challenge CTF vers le skill de catégorie adéquat (crypto/reverse/web/pwn/forensics/osint/stego/misc). Utiliser au démarrage de chaque challenge CTF.
+description: Routage initial de tout challenge CTF vers le couple `ctf-core-methodology` + skill spécialisé adapté (crypto/reverse/web/pwn/forensics/osint/stego/misc/mobile/blockchain/cloud/hardware/jail). Utiliser au démarrage de chaque challenge CTF.
 ---
 
 # CTF Category Router
 
 ## Routing
 1. Lire l’énoncé, artefacts, service cible.
-2. Assigner une catégorie principale + secondaire éventuelle.
-3. Appliquer le skill correspondant immédiatement.
+2. Assigner une catégorie principale, puis noter une catégorie secondaire éventuelle sans compliquer le routage.
+3. Charger toujours `ctf-core-methodology` puis le skill spécialisé de la catégorie principale.
+4. En cas d’ambiguïté forte, choisir la catégorie qui maximise la résolution terminal-first la moins coûteuse.
 
 ## Mapping rapide
 - Crypto: chiffrements, signatures, maths
@@ -17,4 +19,9 @@ description: Routage initial de tout challenge CTF vers le skill de catégorie a
 - Forensics: preuves disque/ram/pcap/logs
 - OSINT: investigation sources ouvertes
 - Stego: données cachées médias
-- Misc: tout le reste / hybrides
+- Mobile: APK/IPA, app Android/iOS, instrumentation légère
+- Blockchain: smart contracts, EVM, RPC, storage on-chain
+- Cloud: IAM, containers, buckets, kube, metadata, CI/CD
+- Hardware: firmware, bus, UART/JTAG, RF, SDR, embedded
+- Jail: pyjail, shell jail, seccomp, sandbox escape
+- Misc: tout le reste ou vrai hybride non dominant

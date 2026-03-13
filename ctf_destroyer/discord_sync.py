@@ -3,7 +3,10 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 import json
 from pathlib import Path
-from typing import Any, Protocol
+import threading
+import time
+import sys
+from typing import Any, Callable, Protocol
 from urllib import error, request
 
 from .workspace import merge_challenge_manifest
@@ -12,6 +15,7 @@ from .workspace import merge_challenge_manifest
 DISCORD_API_BASE_URL = "https://discord.com/api/v10"
 MAX_THREAD_NAME_LENGTH = 100
 MAX_MESSAGE_LENGTH = 1900
+DEFAULT_WORKER_COMMAND_BATCH_SECONDS = 10.0
 THREAD_TYPE_BY_NAME = {
     "public": 11,
     "private": 12,
@@ -47,8 +51,16 @@ class DiscordApiError(RuntimeError):
 
 
 class DiscordHttpTransport:
-    def __init__(self, bot_token: str) -> None:
+    def __init__(
+        self,
+        bot_token: str,
+        *,
+        max_retries: int = 3,
+        sleep_fn: Callable[[float], None] = time.sleep,
+    ) -> None:
         self.bot_token = bot_token
+        self.max_retries = max_retries
+        self.sleep_fn = sleep_fn
 
     def request(
         self,
@@ -56,35 +68,66 @@ class DiscordHttpTransport:
         path: str,
         payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        body = None if payload is None else json.dumps(payload).encode("utf-8")
-        headers = {
-            "Authorization": f"Bot {self.bot_token}",
-            "User-Agent": "ctf-destroyer/0.1",
-        }
-        if body is not None:
-            headers["Content-Type"] = "application/json"
+        for attempt in range(self.max_retries + 1):
+            body = None if payload is None else json.dumps(payload).encode("utf-8")
+            headers = {
+                "Authorization": f"Bot {self.bot_token}",
+                "User-Agent": "ctf-destroyer/0.1",
+            }
+            if body is not None:
+                headers["Content-Type"] = "application/json"
 
-        req = request.Request(
-            f"{DISCORD_API_BASE_URL}{path}",
-            data=body,
-            headers=headers,
-            method=method,
-        )
-        try:
-            with request.urlopen(req) as response:
-                text = response.read().decode("utf-8")
-        except error.HTTPError as exc:
-            error_text = exc.read().decode("utf-8", errors="replace")
-            raise DiscordApiError(f"Discord API returned HTTP {exc.code}: {error_text}") from exc
-        except error.URLError as exc:
-            raise DiscordApiError(f"Unable to reach Discord API: {exc.reason}") from exc
+            req = request.Request(
+                f"{DISCORD_API_BASE_URL}{path}",
+                data=body,
+                headers=headers,
+                method=method,
+            )
+            try:
+                with request.urlopen(req) as response:
+                    text = response.read().decode("utf-8")
+            except error.HTTPError as exc:
+                try:
+                    error_text = exc.read().decode("utf-8", errors="replace")
+                finally:
+                    exc.close()
+                if exc.code == 429 and attempt < self.max_retries:
+                    retry_after = _extract_retry_after_seconds(error_text, exc.headers)
+                    self.sleep_fn(retry_after)
+                    continue
+                raise DiscordApiError(f"Discord API returned HTTP {exc.code}: {error_text}") from exc
+            except error.URLError as exc:
+                raise DiscordApiError(f"Unable to reach Discord API: {exc.reason}") from exc
 
-        if not text:
-            return {}
-        payload_data = json.loads(text)
-        if not isinstance(payload_data, dict):
-            raise DiscordApiError("Discord API returned an unexpected payload.")
-        return payload_data
+            if not text:
+                return {}
+            payload_data = json.loads(text)
+            if not isinstance(payload_data, dict):
+                raise DiscordApiError("Discord API returned an unexpected payload.")
+            return payload_data
+        raise DiscordApiError("Discord API retry budget exhausted.")
+
+
+class TimerHandle(Protocol):
+    def start(self) -> None:
+        ...
+
+    def cancel(self) -> None:
+        ...
+
+
+@dataclass(frozen=True)
+class WorkerCommandEvent:
+    status: str
+    backend: str
+    command: str
+    exit_code: Any = None
+
+
+def _default_timer_factory(interval_seconds: float, callback: Callable[[], None]) -> TimerHandle:
+    timer = threading.Timer(interval_seconds, callback)
+    timer.daemon = True
+    return timer
 
 
 class DiscordClient:
@@ -95,6 +138,7 @@ class DiscordClient:
     ) -> None:
         self.config = config
         self.transport = transport or DiscordHttpTransport(config.bot_token)
+        self._request_lock = threading.Lock()
 
     def ensure_challenge_thread(
         self,
@@ -124,7 +168,7 @@ class DiscordClient:
             challenge_metadata=metadata,
         )
 
-        created = self.transport.request(
+        created = self._request(
             "POST",
             f"/channels/{self.config.parent_channel_id}/threads",
             payload={
@@ -193,13 +237,129 @@ class DiscordClient:
         if writeup_content:
             self.post_message(thread.thread_id, writeup_content)
 
-    def post_message(self, thread_id: str, content: str) -> None:
+    def post_message(self, channel_id: str, content: str) -> None:
         for chunk in _chunk_message(content):
-            self.transport.request(
+            self._request(
                 "POST",
-                f"/channels/{thread_id}/messages",
+                f"/channels/{channel_id}/messages",
                 payload={"content": chunk},
             )
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        with self._request_lock:
+            return self.transport.request(method, path, payload=payload)
+
+
+class DiscordDispatcher:
+    def __init__(
+        self,
+        client: DiscordClient,
+        *,
+        flush_interval_seconds: float = DEFAULT_WORKER_COMMAND_BATCH_SECONDS,
+        timer_factory: Callable[[float, Callable[[], None]], TimerHandle] = _default_timer_factory,
+    ) -> None:
+        self.client = client
+        self.flush_interval_seconds = flush_interval_seconds
+        self._timer_factory = timer_factory
+        self._lock = threading.Lock()
+        self._pending_commands: dict[str, list[WorkerCommandEvent]] = {}
+        self._timers: dict[str, TimerHandle] = {}
+        self._closed = False
+
+    def enqueue_worker_command(
+        self,
+        channel_id: str,
+        *,
+        status: str,
+        backend: str,
+        command: str,
+        exit_code: Any = None,
+    ) -> None:
+        timer_to_start: TimerHandle | None = None
+        with self._lock:
+            if self._closed:
+                return
+            self._pending_commands.setdefault(channel_id, []).append(
+                WorkerCommandEvent(
+                    status=status,
+                    backend=backend,
+                    command=command,
+                    exit_code=exit_code,
+                )
+            )
+            if channel_id not in self._timers:
+                timer = self._timer_factory(
+                    self.flush_interval_seconds,
+                    lambda: self._flush_channel_commands_safe(channel_id),
+                )
+                self._timers[channel_id] = timer
+                timer_to_start = timer
+        if timer_to_start is not None:
+            timer_to_start.start()
+
+    def flush_channel_commands(self, channel_id: str) -> None:
+        events = self._take_channel_events(channel_id)
+        if not events:
+            return
+        try:
+            self.client.post_message(
+                channel_id,
+                _render_worker_command_batch(events, self.flush_interval_seconds),
+            )
+        except Exception:
+            self._requeue_channel_events(channel_id, events)
+            raise
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+            channel_ids = list(self._pending_commands.keys())
+        for channel_id in channel_ids:
+            try:
+                self.flush_channel_commands(channel_id)
+            except Exception as exc:
+                sys.stderr.write(f"[warning] discord dispatcher flush failed for {channel_id}: {exc}\n")
+                sys.stderr.flush()
+
+    def _take_channel_events(self, channel_id: str) -> list[WorkerCommandEvent]:
+        with self._lock:
+            events = list(self._pending_commands.pop(channel_id, []))
+            timer = self._timers.pop(channel_id, None)
+        if timer is not None:
+            timer.cancel()
+        return events
+
+    def _requeue_channel_events(self, channel_id: str, events: list[WorkerCommandEvent]) -> None:
+        if not events:
+            return
+        timer_to_start: TimerHandle | None = None
+        with self._lock:
+            if self._closed:
+                return
+            current = self._pending_commands.setdefault(channel_id, [])
+            self._pending_commands[channel_id] = list(events) + current
+            if channel_id not in self._timers:
+                timer = self._timer_factory(
+                    self.flush_interval_seconds,
+                    lambda: self._flush_channel_commands_safe(channel_id),
+                )
+                self._timers[channel_id] = timer
+                timer_to_start = timer
+        if timer_to_start is not None:
+            timer_to_start.start()
+
+    def _flush_channel_commands_safe(self, channel_id: str) -> None:
+        try:
+            self.flush_channel_commands(channel_id)
+        except Exception as exc:
+            sys.stderr.write(f"[warning] discord dispatcher flush failed for {channel_id}: {exc}\n")
+            sys.stderr.flush()
 
 
 def load_thread_binding(workspace: Path) -> DiscordThreadRef | None:
@@ -252,6 +412,107 @@ def save_thread_binding(workspace: Path, binding: DiscordThreadRef) -> None:
             }
         },
     )
+
+
+class ChallengeDiscordObserver:
+    def __init__(
+        self,
+        client: DiscordClient,
+        dispatcher: DiscordDispatcher | None = None,
+    ) -> None:
+        self.client = client
+        self.dispatcher = dispatcher or DiscordDispatcher(client)
+        self._threads_by_workspace: dict[str, DiscordThreadRef] = {}
+
+    def handle_event(self, event_type: str, payload: dict[str, Any]) -> None:
+        workspace = payload.get("workspace")
+        if not workspace:
+            return
+        workspace_path = Path(str(workspace))
+
+        if event_type == "challenge_workspace_prepared":
+            thread = self.client.ensure_challenge_thread(
+                workspace=workspace_path,
+                challenge_name=str(payload.get("challenge_name", "challenge")),
+                challenge_text=str(payload.get("challenge_text", "")),
+                category_hint=_maybe_str(payload.get("category_hint")),
+                target_host=_maybe_str(payload.get("target_host")),
+                challenge_metadata=_maybe_dict(payload.get("challenge_metadata")),
+                artifact_paths=[str(item) for item in list(payload.get("artifact_paths", []))],
+            )
+            self._threads_by_workspace[str(workspace_path)] = thread
+            return
+
+        thread = self._get_thread(workspace_path)
+        if thread is None:
+            return
+        if event_type == "route_resolved":
+            self.client.publish_route(
+                thread,
+                category=str(payload.get("category", "unknown")),
+                reason=str(payload.get("category_reason", "")),
+                skill_slug=str(payload.get("specialist_skill_slug", "")),
+            )
+            return
+        if event_type == "attempt_completed":
+            self.dispatcher.flush_channel_commands(thread.thread_id)
+            self.client.publish_attempt(thread, payload)
+            return
+        if event_type == "worker_command_started":
+            self.dispatcher.enqueue_worker_command(
+                thread.thread_id,
+                status="started",
+                backend=str(payload.get("backend", "worker")),
+                command=str(payload.get("command", "")),
+            )
+            return
+        if event_type == "worker_command_completed":
+            self.dispatcher.enqueue_worker_command(
+                thread.thread_id,
+                status="completed",
+                backend=str(payload.get("backend", "worker")),
+                command=str(payload.get("command", "")),
+                exit_code=payload.get("exit_code"),
+            )
+            return
+        if event_type == "challenge_completed":
+            self.dispatcher.flush_channel_commands(thread.thread_id)
+            self.client.publish_final(thread, payload)
+
+    def _get_thread(self, workspace: Path) -> DiscordThreadRef | None:
+        existing = self._threads_by_workspace.get(str(workspace))
+        if existing is not None:
+            return existing
+        existing = load_thread_binding(workspace)
+        if existing is not None:
+            self._threads_by_workspace[str(workspace)] = existing
+        return existing
+
+
+class CampaignDiscordObserver:
+    def __init__(self, client: DiscordClient, campaign_dir: Path) -> None:
+        self.client = client
+        self.campaign_dir = campaign_dir
+
+    def handle_event(self, event_type: str, payload: dict[str, Any]) -> None:
+        if event_type == "campaign_started":
+            remove_campaign_thread_binding(self.campaign_dir)
+            self.client.post_message(
+                self.client.config.parent_channel_id,
+                _render_campaign_started_message(payload),
+            )
+            return
+        if event_type == "campaign_import_completed":
+            self.client.post_message(self.client.config.parent_channel_id, _render_campaign_import_message(payload))
+            return
+        if event_type == "campaign_challenge_started":
+            self.client.post_message(self.client.config.parent_channel_id, _render_campaign_challenge_started(payload))
+            return
+        if event_type == "campaign_challenge_completed":
+            self.client.post_message(self.client.config.parent_channel_id, _render_campaign_challenge_completed(payload))
+            return
+        if event_type == "campaign_completed":
+            self.client.post_message(self.client.config.parent_channel_id, _render_campaign_completed(payload))
 
 
 def _chunk_message(content: str) -> list[str]:
@@ -321,6 +582,49 @@ def _truncate(value: str, limit: int) -> str:
     return f"{compact[: limit - 3].rstrip()}..."
 
 
+def _extract_retry_after_seconds(error_text: str, headers: Any) -> float:
+    retry_after = None
+    if isinstance(headers, dict):
+        retry_after = headers.get("Retry-After")
+    elif headers is not None:
+        retry_after = headers.get("Retry-After")
+    if retry_after is not None:
+        try:
+            return max(0.0, float(retry_after))
+        except (TypeError, ValueError):
+            pass
+    try:
+        payload = json.loads(error_text)
+    except json.JSONDecodeError:
+        payload = {}
+    if isinstance(payload, dict):
+        try:
+            return max(0.0, float(payload.get("retry_after", 1.0)))
+        except (TypeError, ValueError):
+            return 1.0
+    return 1.0
+
+
+def _render_worker_command_batch(
+    events: list[WorkerCommandEvent],
+    flush_interval_seconds: float,
+) -> str:
+    lines = [f"Worker activity ({_format_window_seconds(flush_interval_seconds)} window)."]
+    for event in events:
+        status_line = f"[{event.backend}] {event.status}"
+        if event.exit_code is not None:
+            status_line += f" (exit {event.exit_code})"
+        lines.append(f"- {status_line}: `{_truncate(event.command, 500)}`")
+    return "\n".join(lines)
+
+
+def _format_window_seconds(value: float) -> str:
+    rounded = int(value)
+    if abs(value - rounded) < 1e-9:
+        return f"{rounded}s"
+    return f"{value:.1f}s"
+
+
 def _load_writeup_content(final_state: dict[str, Any]) -> str | None:
     if not final_state.get("solved"):
         return None
@@ -337,3 +641,84 @@ def _load_writeup_content(final_state: dict[str, Any]) -> str | None:
     if not content:
         return None
     return content
+
+
+def _maybe_str(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _maybe_dict(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, dict):
+        return value
+    return None
+
+
+def _render_campaign_started_message(payload: dict[str, Any]) -> str:
+    lines = [
+        f"Campaign: **{payload.get('campaign_name', 'campaign')}**",
+        f"Source: `{payload.get('source_label', 'unknown')}`",
+    ]
+    filters = payload.get("filters")
+    if isinstance(filters, dict) and filters:
+        lines.append(f"Filters: `{_truncate(json.dumps(filters, ensure_ascii=False), 500)}`")
+    capacities = payload.get("capacities")
+    if isinstance(capacities, dict) and capacities:
+        lines.append(f"Capacities: `{_truncate(json.dumps(capacities, ensure_ascii=False), 300)}`")
+    return "\n".join(lines)
+
+
+def _render_campaign_import_message(payload: dict[str, Any]) -> str:
+    return "\n".join(
+        [
+            "Campaign import completed.",
+            f"Discovered: `{payload.get('discovered', 0)}`",
+            f"Eligible: `{payload.get('eligible', 0)}`",
+            f"Skipped: `{payload.get('skipped', 0)}`",
+            f"Import failed: `{payload.get('import_failed', 0)}`",
+        ]
+    )
+
+
+def _render_campaign_challenge_started(payload: dict[str, Any]) -> str:
+    lines = [
+        f"Starting challenge: **{payload.get('challenge_name', 'challenge')}**",
+        f"Category: `{payload.get('category', 'unknown')}`",
+        f"Priority: `{payload.get('priority_reason', 'n/a')}`",
+    ]
+    if payload.get("instance_required"):
+        lines.append("Consumes instance capacity: `yes`")
+    return "\n".join(lines)
+
+
+def _render_campaign_challenge_completed(payload: dict[str, Any]) -> str:
+    lines = [
+        f"Challenge completed: **{payload.get('challenge_name', 'challenge')}**",
+        f"Status: `{payload.get('status', 'unknown')}`",
+        f"Summary: `{_truncate(str(payload.get('summary', '')), 500)}`",
+    ]
+    if payload.get("final_flag"):
+        lines.append(f"Flag: `{payload.get('final_flag')}`")
+    return "\n".join(lines)
+
+
+def _render_campaign_completed(payload: dict[str, Any]) -> str:
+    counts = payload.get("counts", {})
+    return "\n".join(
+        [
+            "Campaign completed.",
+            f"Solved: `{counts.get('solved', 0)}`",
+            f"Needs human: `{counts.get('needs_human', 0)}`",
+            f"Skipped: `{counts.get('skipped', 0)}`",
+            f"Import failed: `{counts.get('import_failed', 0)}`",
+            f"Interrupted: `{counts.get('interrupted', 0)}`",
+        ]
+    )
+
+
+def remove_campaign_thread_binding(campaign_dir: Path) -> None:
+    path = campaign_dir / ".discord-campaign-thread.json"
+    if path.exists():
+        path.unlink()

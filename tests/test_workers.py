@@ -1,5 +1,7 @@
 import os
 from pathlib import Path
+import subprocess
+from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
@@ -8,6 +10,8 @@ from ctf_destroyer.workers import (
     ClaudeWorker,
     CodexWorker,
     WorkerRequest,
+    _extract_claude_live_command_event,
+    _extract_codex_live_command_event,
     _compact_attempts_for_prompt,
     _format_claude_event_line,
     _format_codex_event_line,
@@ -63,6 +67,16 @@ class WorkerTraceTest(unittest.TestCase):
             )
         self.assertEqual(started, "[14:23:01] [codex] start: /bin/zsh -lc pwd\n")
         self.assertEqual(completed, "[14:23:01] [codex] done (0): /bin/zsh -lc pwd\n")
+
+    def test_extract_codex_live_command_events(self) -> None:
+        started = _extract_codex_live_command_event(
+            '{"type":"item.started","item":{"id":"item_0","type":"command_execution","command":"/bin/zsh -lc pwd","status":"in_progress"}}'
+        )
+        completed = _extract_codex_live_command_event(
+            '{"type":"item.completed","item":{"id":"item_0","type":"command_execution","command":"/bin/zsh -lc pwd","status":"completed","exit_code":0}}'
+        )
+        self.assertEqual(started, ("worker_command_started", {"backend": "codex", "command": "/bin/zsh -lc pwd", "exit_code": None}))
+        self.assertEqual(completed, ("worker_command_completed", {"backend": "codex", "command": "/bin/zsh -lc pwd", "exit_code": 0}))
 
     def test_prompt_attempt_compaction_keeps_key_commands_and_inline_scripts(self) -> None:
         compacted = _compact_attempts_for_prompt(
@@ -157,6 +171,64 @@ class WorkerTraceTest(unittest.TestCase):
             )
         self.assertEqual(started, "[14:23:01] [claude] start: /bin/zsh -lc pwd\n")
         self.assertEqual(completed, "[14:23:01] [claude] done (ok): toolu_1\n")
+
+    def test_extract_claude_live_command_events(self) -> None:
+        live_state: dict[str, str] = {}
+        started = _extract_claude_live_command_event(
+            '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"pwd"}}]}}',
+            live_state,
+        )
+        completed = _extract_claude_live_command_event(
+            '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok","is_error":false}]}}',
+            live_state,
+        )
+        self.assertEqual(
+            started,
+            ("worker_command_started", {"backend": "claude", "command": "/bin/zsh -lc pwd", "exit_code": None}),
+        )
+        self.assertEqual(
+            completed,
+            ("worker_command_completed", {"backend": "claude", "command": "/bin/zsh -lc pwd", "exit_code": 0}),
+        )
+
+    def test_codex_streaming_timeout_terminates_process_tree(self) -> None:
+        class FakeTimedOutProcess:
+            stdin = None
+            stdout = None
+            stderr = None
+            pid = 4242
+
+            def wait(self, timeout=None):
+                raise subprocess.TimeoutExpired(cmd="codex", timeout=timeout)
+
+        with TemporaryDirectory() as tmp_dir:
+            request = _worker_request()
+            request = WorkerRequest(
+                attempt_index=request.attempt_index,
+                challenge_name=request.challenge_name,
+                challenge_text=request.challenge_text,
+                challenge_category=request.challenge_category,
+                target_host=request.target_host,
+                metadata=request.metadata,
+                artifact_paths=request.artifact_paths,
+                workspace=Path(tmp_dir),
+                skill=request.skill,
+                prior_attempts=request.prior_attempts,
+                working_memory=request.working_memory,
+            )
+            with patch.dict(os.environ, {"WORKER_STREAM_EVENTS": "1"}, clear=True):
+                worker = CodexWorker()
+            worker.timeout_seconds = 1
+            with (
+                patch.object(CodexWorker, "_build_command", return_value=["codex"]),
+                patch("ctf_destroyer.workers.subprocess.Popen", return_value=FakeTimedOutProcess()),
+                patch("ctf_destroyer.workers._terminate_process_tree") as terminate_process_tree,
+            ):
+                result = worker.invoke(request)
+
+        self.assertEqual(result.status, "blocked")
+        self.assertIn("timed out after 1 seconds", result.summary)
+        terminate_process_tree.assert_called_once()
 
 
 if __name__ == "__main__":

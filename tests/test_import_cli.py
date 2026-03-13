@@ -10,7 +10,8 @@ import unittest
 from unittest.mock import patch
 
 from ctf_destroyer.import_cli import main, parse_args
-from ctf_destroyer.importers.models import DiscoveredChallenge, ImportedChallenge, SourceDocument
+from ctf_destroyer.import_service import BoardImportContext, ImportedChallengeRecord
+from ctf_destroyer.importers.models import DiscoveredChallenge, ImportedChallenge, ImportRequest, SourceDocument
 
 
 class ImportCliTest(unittest.TestCase):
@@ -129,31 +130,61 @@ class ImportCliTest(unittest.TestCase):
         stderr_buffer = io.StringIO()
         stdout_buffer = io.StringIO()
         with patch(
-            "ctf_destroyer.import_cli.load_source_document",
-            return_value=SourceDocument(source_type="url_html", source_label="https://ctf.example.com/challenges", raw_text=""),
-        ), patch(
-            "ctf_destroyer.import_cli.try_discover_ctfd_challenges",
-            return_value=[
-                DiscoveredChallenge(
-                    title="Operating Room",
-                    text_block="Operating Room",
-                    challenge_id=26,
+            "ctf_destroyer.import_cli.load_board_context",
+            return_value=BoardImportContext(
+                import_request=ImportRequest(
+                    source="https://ctf.example.com/challenges",
+                    input_file=None,
+                    output=None,
+                    use_stdout=False,
+                    review=False,
+                    selected_challenge=None,
+                    list_only=False,
+                    session_cookie=None,
+                    cookie_file=None,
+                    start_instance=True,
+                ),
+                document=SourceDocument(
+                    source_type="url_html",
                     source_label="https://ctf.example.com/challenges",
+                    raw_text="",
+                ),
+                candidates=[
+                    DiscoveredChallenge(
+                        title="Operating Room",
+                        text_block="Operating Room",
+                        challenge_id=26,
+                        source_label="https://ctf.example.com/challenges",
+                    )
+                ],
+                board_source_key="board-demo",
+                source_label="https://ctf.example.com/challenges",
+            ),
+        ), patch(
+            "ctf_destroyer.import_cli.import_selected_candidates",
+            return_value=[
+                ImportedChallengeRecord(
+                    candidate=DiscoveredChallenge(
+                        title="Operating Room",
+                        text_block="Operating Room",
+                        challenge_id=26,
+                        source_label="https://ctf.example.com/challenges",
+                    ),
+                    imported=ImportedChallenge(
+                        title="Operating Room",
+                        description="Control system challenge.",
+                        category="ot",
+                        target_host=None,
+                        import_metadata={"start_instance_result": "failed"},
+                        warnings=[
+                            "Target host was not detected from the source.",
+                            "Container start request timed out before access became available: timed out",
+                        ],
+                    ),
+                    payload=None,
+                    error="failed to acquire instance access for 'Operating Room' (start_instance_result=failed). Details: Target host was not detected from the source.; Container start request timed out before access became available: timed out",
                 )
             ],
-        ), patch(
-            "ctf_destroyer.import_cli.import_ctfd_challenge",
-            return_value=ImportedChallenge(
-                title="Operating Room",
-                description="Control system challenge.",
-                category="ot",
-                target_host=None,
-                import_metadata={"start_instance_result": "failed"},
-                warnings=[
-                    "Target host was not detected from the source.",
-                    "Container start request timed out before access became available: timed out",
-                ],
-            ),
         ), redirect_stderr(stderr_buffer), redirect_stdout(stdout_buffer):
             status = main(
                 [

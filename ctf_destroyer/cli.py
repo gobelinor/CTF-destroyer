@@ -5,14 +5,17 @@ import json
 import os
 from pathlib import Path
 import sys
-from typing import Any, Callable
+from typing import Any
 
 from .challenges import normalize_challenge_payload
-from .discord_sync import DiscordClient, DiscordThreadRef, load_thread_binding, resolve_discord_config
-from .graph import build_initial_state, build_orchestrator, load_resume_context
+from .discord_sync import ChallengeDiscordObserver, DiscordClient, DiscordDispatcher, resolve_discord_config
+from .orchestrator_service import (
+    ChallengeRunRequest,
+    render_writeup_markdown,
+    run_challenge,
+    validate_challenge_actionability,
+)
 from .writeups import generate_writeup_markdown
-from .workers import build_worker_pool
-from .workspace import prepare_challenge_workspace
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -76,24 +79,14 @@ def main(argv: list[str] | None = None) -> int:
     target_host = challenge.get("target_host")
     challenge_metadata = dict(challenge.get("challenge_metadata", {}))
 
-    if not challenge_name or not challenge_text:
-        raise SystemExit("challenge name and challenge text are required.")
-    _validate_challenge_actionability(challenge_name, target_host, challenge_metadata)
-
-    challenge_workspace, staged_artifacts = prepare_challenge_workspace(
-        workspace_root=args.workspace,
-        challenge_name=challenge_name,
-        artifact_paths=artifact_paths,
-        challenge_payload={
-            "challenge_name": challenge_name,
-            "challenge_text": challenge_text,
-            "category_hint": category_hint,
-            "target_host": target_host,
-            "challenge_metadata": challenge_metadata,
-            "artifact_paths": artifact_paths,
-        },
-        source_root=source_root,
-    )
+    challenge_payload = {
+        "challenge_name": challenge_name,
+        "challenge_text": challenge_text,
+        "category_hint": category_hint,
+        "target_host": target_host,
+        "challenge_metadata": challenge_metadata,
+        "artifact_paths": artifact_paths,
+    }
     try:
         discord_config = resolve_discord_config(
             bot_token=args.discord_bot_token,
@@ -102,88 +95,31 @@ def main(argv: list[str] | None = None) -> int:
         )
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
-    discord_client = DiscordClient(discord_config) if discord_config else None
-    discord_thread = None
-    if discord_client is not None:
-        try:
-            existing_thread = load_thread_binding(challenge_workspace)
-            if existing_thread is not None:
-                discord_thread = existing_thread
-                _info(
-                    "discord thread reused: "
-                    f"{discord_thread.thread_name} ({discord_thread.thread_id}) "
-                    f"in parent {discord_thread.parent_channel_id}"
-                )
-            else:
-                discord_thread = discord_client.ensure_challenge_thread(
-                    workspace=challenge_workspace,
-                    challenge_name=challenge_name,
-                    challenge_text=challenge_text,
-                    category_hint=category_hint,
-                    target_host=target_host,
-                    challenge_metadata=challenge_metadata,
-                    artifact_paths=staged_artifacts,
-                )
-                _info(
-                    "discord thread created: "
-                    f"{discord_thread.thread_name} ({discord_thread.thread_id}) "
-                    f"in parent {discord_thread.parent_channel_id}"
-                )
-        except Exception as exc:
-            _warn(f"discord thread setup failed: {exc}")
-            discord_client = None
+    dispatcher = None
+    observer = None
+    if discord_config:
+        client = DiscordClient(discord_config)
+        dispatcher = DiscordDispatcher(client)
+        observer = ChallengeDiscordObserver(client, dispatcher)
 
     backend_sequence = [item.strip() for item in args.backend_sequence.split(",") if item.strip()]
-    workers = build_worker_pool(backend_sequence)
-    graph = build_orchestrator(
-        args.skills_root,
-        workers,
-        event_handler=_build_discord_event_handler(discord_client, discord_thread),
-    )
-    resumed_history, resumed_memory = load_resume_context(challenge_workspace)
-    if resumed_history:
-        _info(
-            "resume context loaded: "
-            f"{len(resumed_history)} prior attempt(s) from {challenge_workspace / '.runs'}"
+    try:
+        result = run_challenge(
+            ChallengeRunRequest(
+                challenge_payload=challenge_payload,
+                source_root=source_root,
+                workspace_root=args.workspace,
+                skills_root=args.skills_root,
+                thread_id=args.thread_id,
+                max_attempts=args.max_attempts,
+                backend_sequence=backend_sequence,
+            ),
+            event_sink=observer.handle_event if observer is not None else None,
         )
-    initial_state = build_initial_state(
-        challenge_name=challenge_name,
-        challenge_text=challenge_text,
-        workspace=challenge_workspace,
-        backend_sequence=backend_sequence,
-        category_hint=category_hint,
-        target_host=target_host,
-        challenge_metadata=challenge_metadata,
-        artifact_paths=staged_artifacts,
-        history=resumed_history,
-        working_memory=resumed_memory,
-        max_attempts=args.max_attempts,
-    )
-    final_state = graph.invoke(
-        initial_state,
-        config={"configurable": {"thread_id": args.thread_id}},
-    )
-    _maybe_write_writeup(
-        workspace=challenge_workspace,
-        challenge_name=str(challenge_name),
-        challenge_text=str(challenge_text),
-        category_hint=category_hint,
-        target_host=target_host,
-        final_state=final_state,
-        skills_root=args.skills_root,
-        workers=workers,
-        backend_sequence=backend_sequence,
-    )
-    if discord_client is not None and discord_thread is not None:
-        try:
-            discord_client.publish_final(discord_thread, final_state)
-            _info(
-                "discord final update posted: "
-                f"{discord_thread.thread_name} ({discord_thread.thread_id})"
-            )
-        except Exception as exc:
-            _warn(f"discord final update failed: {exc}")
-    print(json.dumps(final_state, indent=2))
+    finally:
+        if dispatcher is not None:
+            dispatcher.close()
+    print(json.dumps(result.final_state, indent=2))
     return 0
 
 
@@ -200,23 +136,7 @@ def _validate_challenge_actionability(
     target_host: str | None,
     challenge_metadata: dict[str, Any],
 ) -> None:
-    import_metadata = challenge_metadata.get("import_metadata")
-    if not isinstance(import_metadata, dict):
-        return
-    if target_host:
-        return
-    if not import_metadata.get("start_instance_requested"):
-        return
-
-    start_result = str(import_metadata.get("start_instance_result") or "unknown")
-    warnings = import_metadata.get("warnings")
-    detail_suffix = ""
-    if isinstance(warnings, list) and warnings:
-        detail_suffix = f" Details: {'; '.join(str(item) for item in warnings)}"
-    raise SystemExit(
-        f"Challenge '{challenge_name}' is not actionable: instance access is missing "
-        f"after requested startup (start_instance_result={start_result}).{detail_suffix}"
-    )
+    validate_challenge_actionability(challenge_name, target_host, challenge_metadata)
 
 
 def _maybe_write_writeup(
@@ -246,8 +166,8 @@ def _maybe_write_writeup(
                 target_host=target_host,
                 final_state=final_state,
             )
-        except Exception as exc:
-            _warn(f"writeup worker failed: {exc}")
+        except Exception:
+            markdown = None
 
     writeup_path = workspace / "writeup.md"
     writeup_path.write_text(
@@ -270,159 +190,13 @@ def _render_writeup_markdown(
     target_host: str | None,
     final_state: dict[str, Any],
 ) -> str:
-    history = [item for item in final_state.get("history", []) if isinstance(item, dict)]
-    latest_output = final_state.get("latest_worker_output", {})
-    latest_commands = list(latest_output.get("commands", [])) if isinstance(latest_output, dict) else []
-    flag = str(final_state.get("final_flag") or "").strip()
-    summary = _compact_text(str(final_state.get("final_summary", "")))
-    approach_points = _build_writeup_approach_points(summary, history)
-    commands = _collect_writeup_commands(history, latest_commands)
-    script_snippets = _collect_writeup_scripts(history)
-
-    lines = [
-        "# Writeup",
-        "",
-        f"**Challenge:** {challenge_name}",
-    ]
-    if category_hint:
-        lines.append(f"**Category:** `{category_hint}`")
-    if target_host:
-        lines.append(f"**Target:** `{target_host}`")
-    if flag:
-        lines.append(f"**Flag:** `{flag}`")
-
-    lines.extend(
-        [
-            "",
-            "## Challenge",
-            "",
-            _compact_text(challenge_text, limit=600),
-            "",
-            "## Resolution",
-            "",
-        ]
+    return render_writeup_markdown(
+        challenge_name=challenge_name,
+        challenge_text=challenge_text,
+        category_hint=category_hint,
+        target_host=target_host,
+        final_state=final_state,
     )
-    lines.extend(f"- {point}" for point in approach_points)
-
-    lines.extend(
-        [
-            "",
-            "## Solve",
-            "",
-        ]
-    )
-    if commands:
-        lines.extend(
-            [
-                "```bash",
-                *commands,
-                "```",
-            ]
-        )
-    else:
-        lines.append("No shell commands were required to recover the flag.")
-
-    if script_snippets:
-        lines.extend(
-            [
-                "",
-                "## Scripts",
-                "",
-            ]
-        )
-        for index, snippet in enumerate(script_snippets, 1):
-            language = _guess_script_language(snippet)
-            lines.extend(
-                [
-                    f"### Script {index}",
-                    "",
-                    f"```{language}",
-                    snippet,
-                    "```",
-                    "",
-                ]
-            )
-        if lines[-1] == "":
-            lines.pop()
-
-    return "\n".join(lines).strip() + "\n"
-
-
-def _build_writeup_approach_points(summary: str, history: list[dict[str, Any]]) -> list[str]:
-    points: list[str] = []
-    if summary:
-        points.append(summary)
-
-    for attempt in history[-3:]:
-        attempt_summary = _compact_text(str(attempt.get("summary", "")), limit=220)
-        if attempt_summary and attempt_summary not in points:
-            points.append(attempt_summary)
-        for evidence in attempt.get("evidence", []):
-            compact = _compact_text(str(evidence), limit=180)
-            if compact and compact not in points:
-                points.append(compact)
-            if len(points) >= 5:
-                return points
-    return points[:5] or ["The challenge was solved and the final flag was validated by the worker."]
-
-
-def _collect_writeup_commands(history: list[dict[str, Any]], latest_commands: list[str]) -> list[str]:
-    commands: list[str] = []
-    seen: set[str] = set()
-    for command in latest_commands:
-        compact = _compact_text(str(command), limit=500)
-        if compact and compact not in seen:
-            seen.add(compact)
-            commands.append(compact)
-    for attempt in reversed(history):
-        for command in attempt.get("key_commands", []):
-            compact = _compact_text(str(command), limit=500)
-            if compact and compact not in seen:
-                seen.add(compact)
-                commands.append(compact)
-            if len(commands) >= 8:
-                return commands
-    return commands
-
-
-def _collect_writeup_scripts(history: list[dict[str, Any]]) -> list[str]:
-    snippets: list[str] = []
-    seen: set[str] = set()
-    for attempt in reversed(history):
-        for item in attempt.get("inline_scripts", []):
-            if not isinstance(item, dict):
-                continue
-            snippet = _compact_text(str(item.get("snippet", "")), limit=1200, preserve_newlines=True)
-            if not snippet or snippet in seen:
-                continue
-            seen.add(snippet)
-            snippets.append(snippet)
-            if len(snippets) >= 3:
-                return snippets
-    return snippets
-
-
-def _compact_text(value: str, limit: int = 320, preserve_newlines: bool = False) -> str:
-    normalized = value.strip()
-    if not normalized:
-        return ""
-    if preserve_newlines:
-        lines = [" ".join(line.split()) for line in normalized.splitlines()]
-        compact = "\n".join(line for line in lines if line)
-    else:
-        compact = " ".join(normalized.split())
-    if len(compact) <= limit:
-        return compact
-    return f"{compact[: limit - 3].rstrip()}..."
-
-
-def _guess_script_language(snippet: str) -> str:
-    lowered = snippet.lstrip().lower()
-    if lowered.startswith("import ") or lowered.startswith("from "):
-        return "python"
-    if lowered.startswith("#!/usr/bin/env python") or lowered.startswith("#!/usr/bin/python"):
-        return "python"
-    return "text"
 
 
 def _extract_env_file_arg(argv: list[str]) -> Path | None:
@@ -470,38 +244,6 @@ def _parse_env_value(value: str) -> str:
     if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
         return value[1:-1]
     return value
-
-
-def _build_discord_event_handler(
-    discord_client: DiscordClient | None,
-    discord_thread: DiscordThreadRef | None,
-) -> Callable[[str, dict[str, object]], None] | None:
-    if discord_client is None or discord_thread is None:
-        return None
-
-    def handler(event_type: str, payload: dict[str, object]) -> None:
-        try:
-            if event_type == "route_resolved":
-                discord_client.publish_route(
-                    discord_thread,
-                    category=str(payload.get("category", "unknown")),
-                    reason=str(payload.get("category_reason", "")),
-                    skill_slug=str(payload.get("specialist_skill_slug", "")),
-                )
-            elif event_type == "attempt_completed":
-                discord_client.publish_attempt(discord_thread, payload)
-        except Exception as exc:
-            _warn(f"discord event '{event_type}' failed: {exc}")
-
-    return handler
-
-
-def _warn(message: str) -> None:
-    print(f"[warning] {message}", file=sys.stderr)
-
-
-def _info(message: str) -> None:
-    print(f"[info] {message}", file=sys.stderr)
 
 
 if __name__ == "__main__":
